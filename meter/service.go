@@ -19,6 +19,11 @@ type subRecord struct {
 	planID      string
 	terms       PlanTerms
 	activatedAt time.Time
+	// termsHistory 按生效月份升序记录每次换套餐后的条件；
+	// 首条为开通当月适用的开通快照。账单按账期从中取当时适用的条件。
+	termsHistory []termsEntry
+	// pending 尚未生效的换套餐安排，每账户至多一条；nil 表示无安排。
+	pending *PlanChange
 }
 
 type eventRecord struct {
@@ -158,7 +163,132 @@ func (s *Service) Subscribe(accountID, planID string, activatedAt time.Time) err
 		planID:      planID,
 		terms:       termsOf(plan),
 		activatedAt: activatedAt.UTC(),
+		termsHistory: []termsEntry{{
+			effective: MonthOf(activatedAt),
+			terms:     termsOf(plan),
+		}},
 	}
+	return nil
+}
+
+// nextMonth 返回 period 的下一个 UTC 自然月。
+func nextMonth(period Month) Month {
+	return MonthOf(period.End())
+}
+
+// applyDueChangesLocked 把已到生效月份月初零点的待生效安排落入条件历史。
+// 到达月初零点即生效，无需先上报用量或生成账单；即使中间若干月没有调用服务，
+// 再次进入时也会在此一次性补齐，当前条件仍正确。调用时持有 s.mu。
+func (s *Service) applyDueChangesLocked(acc *account, now time.Time) {
+	sub := acc.sub
+	if sub == nil {
+		return
+	}
+	current := MonthOf(now)
+	for sub.pending != nil && !current.Before(sub.pending.EffectivePeriod) {
+		entry := termsEntry{
+			effective: sub.pending.EffectivePeriod,
+			terms:     sub.pending.Terms,
+		}
+		sub.termsHistory = append(sub.termsHistory, entry)
+		sub.planID = sub.pending.TargetPlanID
+		sub.terms = sub.pending.Terms
+		sub.pending = nil
+	}
+}
+
+// termsForPeriodLocked 返回指定账期当时适用的套餐条件快照。
+// 条件历史按生效月份升序，取不晚于 period 的最后一条；
+// 这样历史账单始终按该账期条件计算，不受后续换套餐影响。调用时持有 s.mu。
+func termsForPeriodLocked(sub *subRecord, period Month) PlanTerms {
+	t := sub.termsHistory[0].terms
+	for _, e := range sub.termsHistory {
+		if period.Before(e.effective) {
+			break
+		}
+		t = e.terms
+	}
+	return t
+}
+
+// SchedulePlanChange 安排账户从下一个 UTC 自然月起改用另一套餐，升级与降级规则相同。
+//
+// 成功时返回目标套餐在本次安排时的完整计费条件快照与生效账期（请求被接受时的
+// 下一个 UTC 自然月），之后修改套餐定义不影响本安排。当前月仍按旧套餐收取完整
+// 月费并提供完整额度，不按天补差，也不迁移本月已发生的用量。
+//
+// 每个账户至多保留一条尚未生效的安排：再次安排同一目标套餐时返回原安排，
+// 不重新取价（Created 为 false）；安排另一目标套餐则替换原安排，生效月份仍为
+// 本次请求被接受时的下一月。欠费停用期间也可以安排。
+//
+// 账户不存在、尚未开通订阅、开通时刻尚未到达、目标套餐不存在、目标套餐与当前
+// 生效套餐相同时请求失败，原有安排保持不变。
+func (s *Service) SchedulePlanChange(accountID, targetPlanID string) (PlanChangeResult, error) {
+	if accountID == "" {
+		return PlanChangeResult{}, invalidf("account id is empty")
+	}
+	if targetPlanID == "" {
+		return PlanChangeResult{}, invalidf("target plan id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return PlanChangeResult{}, ErrAccountNotFound
+	}
+	if acc.sub == nil {
+		return PlanChangeResult{}, ErrSubscriptionNotFound
+	}
+	now := s.nowUTC()
+	if now.Before(acc.sub.activatedAt) {
+		return PlanChangeResult{}, ErrSubscriptionNotActivated
+	}
+	// 先让已到期的安排生效：例如跨月后的首次调用，此时“当前套餐”已是新套餐。
+	s.applyDueChangesLocked(acc, now)
+
+	plan, ok := s.plans[targetPlanID]
+	if !ok {
+		return PlanChangeResult{}, ErrPlanNotFound
+	}
+	if targetPlanID == acc.sub.planID {
+		return PlanChangeResult{}, ErrPlanChangeSamePlan
+	}
+
+	// 已有安排且目标相同：原样返回，不重新取价。
+	if acc.sub.pending != nil && acc.sub.pending.TargetPlanID == targetPlanID {
+		return PlanChangeResult{Created: false, Change: *acc.sub.pending}, nil
+	}
+
+	change := PlanChange{
+		TargetPlanID:    targetPlanID,
+		Terms:           termsOf(plan),
+		EffectivePeriod: nextMonth(MonthOf(now)),
+	}
+	acc.sub.pending = &change
+	return PlanChangeResult{Created: true, Change: change}, nil
+}
+
+// CancelPlanChange 在安排生效前取消它，取消后账户继续沿用当前套餐。
+// 没有待生效安排时取消也成功；已生效的切换不会被撤回。
+// 欠费停用期间也可以取消，取消不清除欠费、不解除停用。
+// 账户不存在或尚未开通订阅时失败。
+func (s *Service) CancelPlanChange(accountID string) error {
+	if accountID == "" {
+		return invalidf("account id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return ErrAccountNotFound
+	}
+	if acc.sub == nil {
+		return ErrSubscriptionNotFound
+	}
+	// 已到生效月份月初零点的安排视为已生效，不可撤回。
+	s.applyDueChangesLocked(acc, s.nowUTC())
+	acc.sub.pending = nil
 	return nil
 }
 
@@ -194,6 +324,9 @@ func (s *Service) RecordEvent(e Event) (EventResult, error) {
 	if acc.sub == nil {
 		return EventResult{}, ErrSubscriptionNotFound
 	}
+
+	// 进入即补齐已到期的换套餐安排，保证并发下各操作观察到一致的当前套餐。
+	s.applyDueChangesLocked(acc, s.nowUTC())
 
 	// 去重优先：完全相同的重报即使发生在出账后或停用期间也返回成功。
 	if prev, ok := acc.events[e.EventID]; ok {
@@ -253,6 +386,10 @@ func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 		return existing.bill, nil
 	}
 
+	// 补齐到期安排（条件历史），随后按账期取该月当时适用的条件：
+	// 即使已经换过套餐或先出新月份账单再补旧月份账单，历史账单也不会被当前套餐覆盖。
+	s.applyDueChangesLocked(acc, s.nowUTC())
+
 	activationMonth := MonthOf(acc.sub.activatedAt)
 	if period.Before(activationMonth) {
 		return Bill{}, ErrBillBeforeSubscription
@@ -262,7 +399,8 @@ func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 		return Bill{}, ErrBillMonthNotEnded
 	}
 
-	bill, err := buildBill(accountID, period, acc.sub.terms, acc.usage[period])
+	terms := termsForPeriodLocked(acc.sub, period)
+	bill, err := buildBill(accountID, period, terms, acc.usage[period])
 	if err != nil {
 		return Bill{}, err
 	}
@@ -364,6 +502,8 @@ func (s *Service) MonthlyUsage(accountID string, period Month) (Usage, error) {
 	if !ok {
 		return Usage{}, ErrAccountNotFound
 	}
+	// 与其他入口保持一致：顺带让已到期的换套餐安排生效。
+	s.applyDueChangesLocked(acc, s.nowUTC())
 	return Usage{Period: period, Total: acc.usage[period]}, nil
 }
 
@@ -378,6 +518,10 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 	if !ok {
 		return AccountStatus{}, ErrAccountNotFound
 	}
+
+	now := s.nowUTC()
+	// 查询即让已到期安排生效：月初零点之后无需上报用量或出账，当前条件立即更新。
+	s.applyDueChangesLocked(acc, now)
 
 	periodSet := make(map[Month]struct{}, len(acc.usage)+len(acc.bills))
 	for m := range acc.usage {
@@ -395,9 +539,16 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 	st := AccountStatus{
 		AccountID:    accountID,
 		Subscribed:   acc.sub != nil,
-		Suspended:    s.isSuspendedLocked(acc, s.nowUTC()),
+		Suspended:    s.isSuspendedLocked(acc, now),
 		MonthlyUsage: make([]Usage, 0, len(periods)),
 		Bills:        make([]BillSummary, 0, len(acc.bills)),
+	}
+	if acc.sub != nil {
+		st.CurrentTerms = acc.sub.terms
+		if acc.sub.pending != nil {
+			pending := *acc.sub.pending
+			st.PendingChange = &pending
+		}
 	}
 	for _, m := range periods {
 		st.MonthlyUsage = append(st.MonthlyUsage, Usage{Period: m, Total: acc.usage[m]})

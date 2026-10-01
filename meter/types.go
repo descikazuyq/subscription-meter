@@ -47,6 +47,32 @@ type Subscription struct {
 	ActivatedAt time.Time
 }
 
+// PlanChange 是一条尚未生效的换套餐安排。
+type PlanChange struct {
+	// TargetPlanID 目标套餐标识。
+	TargetPlanID string
+	// Terms 安排被接受时锁定的目标套餐完整条件快照；
+	// 之后修改套餐定义不影响本安排。
+	Terms PlanTerms
+	// EffectivePeriod 生效账期：安排被接受时的下一个 UTC 自然月。
+	EffectivePeriod Month
+}
+
+// PlanChangeResult 是换套餐安排成功提交的结果。
+type PlanChangeResult struct {
+	// Created 为 true 表示本次新建或替换了安排；
+	// 为 false 表示目标套餐与已有安排相同，返回原安排，未重新取价。
+	Created bool
+	// Change 安排内容：目标套餐完整计费条件与生效账期。
+	Change PlanChange
+}
+
+// termsEntry 是订阅条件历史中的一条：自 EffectivePeriod（含）起适用 Terms。
+type termsEntry struct {
+	effective Month
+	terms     PlanTerms
+}
+
 // Event 是一条用量事件。
 type Event struct {
 	// AccountID 所属账户。
@@ -107,7 +133,8 @@ func (m Month) String() string {
 type Bill struct {
 	AccountID string
 	Period    Month
-	// Terms 出账采用的套餐条件（即订阅开通时的快照）。
+	// Terms 出账采用的套餐条件：该账期当时适用的条件快照
+	// （开通快照或某次已生效换套餐安排锁定的快照）。
 	Terms PlanTerms
 	// TotalUsage 账期内总用量。
 	TotalUsage int64
@@ -169,6 +196,11 @@ type AccountStatus struct {
 	Subscribed bool
 	// Suspended 是否因到期欠费被停用（结清全部到期欠费账单后恢复）。
 	Suspended bool
+	// CurrentTerms 当前账期实际生效的套餐条件；未开通订阅时为零值。
+	// 到达生效月份月初零点后，无需任何操作即为换套餐后的条件。
+	CurrentTerms PlanTerms
+	// PendingChange 尚未生效的换套餐安排；没有安排时为 nil。
+	PendingChange *PlanChange
 	// MonthlyUsage 各账期累计用量，按账期先后排列。
 	MonthlyUsage []Usage
 	// Bills 已生成账单的余额与付清状态，按账期先后排列。
