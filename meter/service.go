@@ -21,6 +21,15 @@ type subRecord struct {
 	activatedAt time.Time
 }
 
+// switchRecord 是一次套餐切换安排。effective 为生效账期，
+// terms 为安排时刻保存的目标套餐快照。生效后该记录转入历史，
+// 用于对应账期的计费。
+type switchRecord struct {
+	planID    string
+	terms     PlanTerms
+	effective Month
+}
+
 type eventRecord struct {
 	at     time.Time
 	qty    int64
@@ -43,6 +52,9 @@ type account struct {
 	usage    map[Month]int64
 	bills    map[Month]*billRecord
 	payments map[string]paymentRecord
+	// switches 保存所有已安排的切换（含已生效与至多一个待生效），
+	// 按生效账期先后排列。待生效安排是其中最后一个元素。
+	switches []switchRecord
 }
 
 // NewService 创建一个以系统时钟判断“当前时刻”的服务。
@@ -162,6 +174,147 @@ func (s *Service) Subscribe(accountID, planID string, activatedAt time.Time) err
 	return nil
 }
 
+// effectiveMonth 返回新安排的生效账期：请求被接受时的下一月。
+// 若请求时刻恰为月初零点（账期边界），则从再下一月生效——
+// 此时当月已按新套餐（或原套餐）执行，新安排无法覆盖当月。
+func effectiveMonth(now time.Time) Month {
+	m := MonthOf(now)
+	if now.Equal(m.Start()) {
+		return MonthOf(m.Start().AddDate(0, 2, 0))
+	}
+	return MonthOf(m.Start().AddDate(0, 1, 0))
+}
+
+// termsForMonth 返回账期 m 适用的套餐条件：
+// 不晚于 m 的最近一次切换的快照；没有切换时为开通快照。
+// 用于历史账期出账，保证每张账单使用对应账期的完整条件。
+func (acc *account) termsForMonth(m Month) PlanTerms {
+	terms := acc.sub.terms
+	for _, sw := range acc.switches {
+		if m.Before(sw.effective) {
+			break
+		}
+		terms = sw.terms
+	}
+	return terms
+}
+
+// currentTerms 返回当前生效的套餐条件与套餐标识。
+func (acc *account) currentTerms(now time.Time) (PlanTerms, string) {
+	m := MonthOf(now)
+	terms := acc.sub.terms
+	planID := acc.sub.planID
+	for _, sw := range acc.switches {
+		if m.Before(sw.effective) {
+			break
+		}
+		terms = sw.terms
+		planID = sw.planID
+	}
+	return terms, planID
+}
+
+// pendingSwitch 返回待生效的切换安排（生效账期晚于当前月）。
+// 每个账户至多一个；没有时 ok=false。
+func (acc *account) pendingSwitch(now time.Time) (switchRecord, bool) {
+	m := MonthOf(now)
+	if len(acc.switches) == 0 {
+		return switchRecord{}, false
+	}
+	last := acc.switches[len(acc.switches)-1]
+	if m.Before(last.effective) {
+		return last, true
+	}
+	return switchRecord{}, false
+}
+
+// SchedulePlanSwitch 为账户安排从下一个 UTC 自然月起切换到目标套餐。
+// 升级与降级采用同一规则：当月仍按旧套餐收取完整月费、提供完整额度，
+// 不按天补差，也不结转本月用量。
+//
+// 每个账户最多保留一个尚未生效的安排：
+//   - 再次选择同一目标套餐时返回原安排，不重新取价；
+//   - 选择另一个目标套餐则替换原安排，生效月份仍为请求被接受时的下一月。
+//
+// 目标套餐的月费、额度、超额单价与税率以本次安排时刻的套餐定义为准，
+// 之后修改套餐定义不影响此安排。
+//
+// 账户不存在、尚未开通订阅、开通时刻尚未到达、目标套餐不存在或与当前
+// 套餐相同时请求失败，原有安排不变。
+func (s *Service) SchedulePlanSwitch(accountID, planID string) (ScheduledSwitch, error) {
+	if accountID == "" {
+		return ScheduledSwitch{}, invalidf("account id is empty")
+	}
+	if planID == "" {
+		return ScheduledSwitch{}, invalidf("plan id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return ScheduledSwitch{}, ErrAccountNotFound
+	}
+	if acc.sub == nil {
+		return ScheduledSwitch{}, ErrSubscriptionNotFound
+	}
+	now := s.nowUTC()
+	if now.Before(acc.sub.activatedAt) {
+		return ScheduledSwitch{}, ErrSubscriptionNotYetActive
+	}
+	plan, ok := s.plans[planID]
+	if !ok {
+		return ScheduledSwitch{}, ErrPlanNotFound
+	}
+
+	// 已有待生效安排且目标相同：返回原安排，不重新取价。
+	if pending, ok := acc.pendingSwitch(now); ok && pending.planID == planID {
+		return ScheduledSwitch{
+			PlanID:    pending.planID,
+			Terms:     pending.terms,
+			Effective: pending.effective,
+		}, nil
+	}
+
+	// 目标套餐与当前生效套餐相同：失败，原有安排不变。
+	_, currentPlanID := acc.currentTerms(now)
+	if planID == currentPlanID {
+		return ScheduledSwitch{}, ErrPlanSameAsCurrent
+	}
+
+	sw := switchRecord{planID: planID, terms: termsOf(plan), effective: effectiveMonth(now)}
+	if _, ok := acc.pendingSwitch(now); ok {
+		// 替换原安排：待生效安排是最后一个元素，生效月份相同。
+		acc.switches[len(acc.switches)-1] = sw
+	} else {
+		acc.switches = append(acc.switches, sw)
+	}
+	return ScheduledSwitch{PlanID: sw.planID, Terms: sw.terms, Effective: sw.effective}, nil
+}
+
+// CancelSchedule 取消账户的待生效安排。取消后继续沿用当前套餐，
+// 不撤回已经生效的切换。没有待生效安排时取消也成功。
+// 账户不存在时失败。
+func (s *Service) CancelSchedule(accountID string) error {
+	if accountID == "" {
+		return invalidf("account id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return ErrAccountNotFound
+	}
+	// 仅移除待生效安排（最后一个元素且生效账期晚于当前月）；
+	// 已生效的切换转入历史，不撤回。
+	now := s.nowUTC()
+	if pending, ok := acc.pendingSwitch(now); ok && MonthOf(now).Before(pending.effective) {
+		acc.switches = acc.switches[:len(acc.switches)-1]
+	}
+	return nil
+}
+
 // RecordEvent 上报一条用量事件。
 //
 // 事件按发生时刻归入 UTC 自然月账期；早于订阅开通或晚于当前时刻的事件被拒绝。
@@ -262,7 +415,10 @@ func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 		return Bill{}, ErrBillMonthNotEnded
 	}
 
-	bill, err := buildBill(accountID, period, acc.sub.terms, acc.usage[period])
+	// 出账采用该账期适用的套餐条件，而非当前套餐：
+	// 切换套餐后补出旧月份账单仍使用历史条件。
+	terms := acc.termsForMonth(period)
+	bill, err := buildBill(accountID, period, terms, acc.usage[period])
 	if err != nil {
 		return Bill{}, err
 	}
@@ -392,12 +548,24 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 	}
 	sortMonths(periods)
 
+	now := s.nowUTC()
 	st := AccountStatus{
 		AccountID:    accountID,
 		Subscribed:   acc.sub != nil,
-		Suspended:    s.isSuspendedLocked(acc, s.nowUTC()),
+		Suspended:    s.isSuspendedLocked(acc, now),
 		MonthlyUsage: make([]Usage, 0, len(periods)),
 		Bills:        make([]BillSummary, 0, len(acc.bills)),
+	}
+	if acc.sub != nil {
+		terms, _ := acc.currentTerms(now)
+		st.CurrentTerms = &terms
+		if pending, ok := acc.pendingSwitch(now); ok {
+			st.Pending = &ScheduledSwitch{
+				PlanID:    pending.planID,
+				Terms:     pending.terms,
+				Effective: pending.effective,
+			}
+		}
 	}
 	for _, m := range periods {
 		st.MonthlyUsage = append(st.MonthlyUsage, Usage{Period: m, Total: acc.usage[m]})

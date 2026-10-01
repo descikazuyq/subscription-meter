@@ -162,6 +162,19 @@ type Usage struct {
 	Total int64
 }
 
+// ScheduledSwitch 是一个待生效的套餐切换安排。
+// 每个账户最多保留一个尚未生效的安排；生效后该安排转入历史，
+// 用于对应账期的计费。
+type ScheduledSwitch struct {
+	// PlanID 目标套餐标识。
+	PlanID string
+	// Terms 安排时刻保存的目标套餐条件快照。
+	// 之后修改套餐定义不影响此安排。
+	Terms PlanTerms
+	// Effective 生效账期（UTC 自然月）。
+	Effective Month
+}
+
 // AccountStatus 是账户当前状态查询结果。
 type AccountStatus struct {
 	AccountID string
@@ -169,6 +182,10 @@ type AccountStatus struct {
 	Subscribed bool
 	// Suspended 是否因到期欠费被停用（结清全部到期欠费账单后恢复）。
 	Suspended bool
+	// CurrentTerms 当前生效的套餐条件快照；未开通订阅时为 nil。
+	CurrentTerms *PlanTerms
+	// Pending 待生效的套餐切换安排；没有时为 nil。
+	Pending *ScheduledSwitch
 	// MonthlyUsage 各账期累计用量，按账期先后排列。
 	MonthlyUsage []Usage
 	// Bills 已生成账单的余额与付清状态，按账期先后排列。

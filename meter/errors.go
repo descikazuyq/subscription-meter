@@ -26,6 +26,11 @@ var (
 	ErrSubscriptionExists = errors.New("meter: subscription already exists")
 	// ErrSubscriptionNotFound 该账户尚未开通订阅。
 	ErrSubscriptionNotFound = errors.New("meter: subscription not found")
+	// ErrSubscriptionNotYetActive 订阅开通时刻尚未到达，暂不能安排切换。
+	ErrSubscriptionNotYetActive = errors.New("meter: subscription not yet active")
+
+	// ErrPlanSameAsCurrent 目标套餐与当前生效套餐相同。
+	ErrPlanSameAsCurrent = errors.New("meter: target plan is the same as current plan")
 
 	// ErrEventConflict 事件标识相同但时刻或数量不同。
 	ErrEventConflict = errors.New("meter: event conflict")
