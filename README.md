@@ -13,12 +13,13 @@ go test ./...
 - `NewService` / `NewServiceWithClock`：创建并发安全的服务（后者可注入时钟）。
 - `CreateAccount`：创建业务账户，标识唯一。
 - `CreatePlan` / `UpdatePlan`：维护套餐（月费、包含用量、超额单价、万分比税率）。
-- `Subscribe`：开通订阅并保存当时的套餐条件快照；每账户一份有效订阅。
+- `Subscribe`：开通订阅并保存当时的套餐条件快照；每账户一份有效订阅。终止后可通过原 `Subscribe` 重新开通，开通时刻不得早于上次终止时刻。
 - `SchedulePlanChange` / `CancelPlanChange`：安排或取消从下一个 UTC 自然月起换用另一套餐；安排时锁定目标套餐完整条件快照，每账户至多一条待生效安排。
+- `CancelSubscription` / `WithdrawCancellation`：按月取消订阅，以请求时刻的下一个 UTC 自然月月初为终止时刻；生效前可撤回，终止后撤回失败。
 - `RecordEvent`：上报用量，按发生时刻归入 UTC 自然月账期，账户内事件标识去重。
 - `CreateBill` / `GetBill`：为已结束的账期出账，重复出账得到同一张账单；每张账单按该账期当时适用的套餐条件计费。
 - `RecordPayment`：分次登记付款，账户内付款标识去重。
-- `MonthlyUsage` / `Status`：查询各月累计用量、当前生效套餐条件、待生效安排、账单余额与欠费停用状态。
+- `MonthlyUsage` / `Status`：查询各月累计用量、当前生效套餐条件、待生效安排、账单余额与欠费停用状态；等待取消时展示终止时刻。
 
 金额与用量均为非负 `int64`，金额单位为分，税率为万分比（0–10000）。
 到期欠费的账户会被停用，结清全部到期欠费账单后恢复。

@@ -124,6 +124,11 @@ func (m Month) Before(other Month) bool {
 	return m.Month < other.Month
 }
 
+// Equal 报告 m 与 other 是否为同一账期。
+func (m Month) Equal(other Month) bool {
+	return m.Year == other.Year && m.Month == other.Month
+}
+
 // String 返回 YYYY-MM 形式。
 func (m Month) String() string {
 	return m.Start().Format("2006-01")
@@ -192,13 +197,16 @@ type Usage struct {
 // AccountStatus 是账户当前状态查询结果。
 type AccountStatus struct {
 	AccountID string
-	// Subscribed 是否已开通订阅。
+	// Subscribed 是否有有效订阅（已开通且未终止）。
 	Subscribed bool
 	// Suspended 是否因到期欠费被停用（结清全部到期欠费账单后恢复）。
 	Suspended bool
-	// CurrentTerms 当前账期实际生效的套餐条件；未开通订阅时为零值。
+	// CurrentTerms 当前账期实际生效的套餐条件；无有效订阅时为零值。
 	// 到达生效月份月初零点后，无需任何操作即为换套餐后的条件。
 	CurrentTerms PlanTerms
+	// CancelAt 不为零值表示订阅已申请取消，将在该时刻（UTC）终止；
+	// 未申请取消或取消已撤回时为零值。
+	CancelAt time.Time
 	// PendingChange 尚未生效的换套餐安排；没有安排时为 nil。
 	PendingChange *PlanChange
 	// MonthlyUsage 各账期累计用量，按账期先后排列。

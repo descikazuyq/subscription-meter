@@ -19,6 +19,11 @@ type subRecord struct {
 	planID      string
 	terms       PlanTerms
 	activatedAt time.Time
+	// terminatedAt 为零值表示尚未终止；非零表示订阅已在该时刻（UTC）终止，
+	// 该时刻不计入订阅期间。
+	terminatedAt time.Time
+	// cancelAt 为零值表示没有待生效的取消；非零表示已申请取消，等待该时刻终止。
+	cancelAt time.Time
 	// termsHistory 按生效月份升序记录每次换套餐后的条件；
 	// 首条为开通当月适用的开通快照。账单按账期从中取当时适用的条件。
 	termsHistory []termsEntry
@@ -42,12 +47,54 @@ type paymentRecord struct {
 }
 
 type account struct {
-	id       string
-	sub      *subRecord
+	id string
+	// subs 保存所有订阅记录，按开通时刻升序；最后一份为当前订阅（若已终止则无有效订阅）。
+	// 重新开通时追加新记录，旧记录保留以供历史账期取条件。
+	subs     []*subRecord
 	events   map[string]eventRecord
 	usage    map[Month]int64
 	bills    map[Month]*billRecord
 	payments map[string]paymentRecord
+}
+
+// currentSub 返回当前有效订阅（最后一份未终止的订阅）；没有则返回 nil。
+func (acc *account) currentSub() *subRecord {
+	if len(acc.subs) == 0 {
+		return nil
+	}
+	last := acc.subs[len(acc.subs)-1]
+	if last.terminatedAt.IsZero() {
+		return last
+	}
+	return nil
+}
+
+// lastSub 返回最后一份订阅记录（无论是否终止）；没有则返回 nil。
+func (acc *account) lastSub() *subRecord {
+	if len(acc.subs) == 0 {
+		return nil
+	}
+	return acc.subs[len(acc.subs)-1]
+}
+
+// subCovering 返回覆盖指定时刻的订阅（activatedAt <= at < terminatedAt）；没有则返回 nil。
+func (acc *account) subCovering(at time.Time) *subRecord {
+	for _, sub := range acc.subs {
+		if !sub.activatedAt.After(at) && (sub.terminatedAt.IsZero() || sub.terminatedAt.After(at)) {
+			return sub
+		}
+	}
+	return nil
+}
+
+// subForPeriod 返回覆盖指定账期的订阅（订阅期间与该月有交集）；没有则返回 nil。
+func (acc *account) subForPeriod(period Month) *subRecord {
+	for _, sub := range acc.subs {
+		if sub.activatedAt.Before(period.End()) && (sub.terminatedAt.IsZero() || sub.terminatedAt.After(period.Start())) {
+			return sub
+		}
+	}
+	return nil
 }
 
 // NewService 创建一个以系统时钟判断“当前时刻”的服务。
@@ -136,6 +183,11 @@ func (s *Service) UpdatePlan(p Plan) error {
 // Subscribe 为账户开通订阅，并保存当时的套餐条件快照。
 // 每个账户只允许一份有效订阅；从 activatedAt 起接收用量，
 // 首月仍收完整月费并提供完整额度。
+//
+// 终止后可通过本方法重新开通：开通时刻不得早于上次终止时刻，
+// 新订阅保存重新开通时的套餐条件快照，当月仍收完整月费并给完整额度。
+// 重新开通不重置账户内事件与付款标识，也不清除旧欠费。
+// 有尚未终止的订阅时再次开通返回 ErrSubscriptionExists。
 func (s *Service) Subscribe(accountID, planID string, activatedAt time.Time) error {
 	if accountID == "" {
 		return invalidf("account id is empty")
@@ -156,18 +208,26 @@ func (s *Service) Subscribe(accountID, planID string, activatedAt time.Time) err
 	if !ok {
 		return ErrPlanNotFound
 	}
-	if acc.sub != nil {
+	// 先让已到期的取消生效：若订阅已终止，currentSub 返回 nil，允许重新开通。
+	s.applyDueChangesLocked(acc, s.nowUTC())
+	if acc.currentSub() != nil {
 		return ErrSubscriptionExists
 	}
-	acc.sub = &subRecord{
+	activatedAt = activatedAt.UTC()
+	if last := acc.lastSub(); last != nil {
+		if activatedAt.Before(last.terminatedAt) {
+			return ErrReactivationTooEarly
+		}
+	}
+	acc.subs = append(acc.subs, &subRecord{
 		planID:      planID,
 		terms:       termsOf(plan),
-		activatedAt: activatedAt.UTC(),
+		activatedAt: activatedAt,
 		termsHistory: []termsEntry{{
 			effective: MonthOf(activatedAt),
 			terms:     termsOf(plan),
 		}},
-	}
+	})
 	return nil
 }
 
@@ -176,11 +236,12 @@ func nextMonth(period Month) Month {
 	return MonthOf(period.End())
 }
 
-// applyDueChangesLocked 把已到生效月份月初零点的待生效安排落入条件历史。
+// applyDueChangesLocked 把已到生效月份月初零点的待生效安排落入条件历史，
+// 并在取消时刻到达时终止订阅。
 // 到达月初零点即生效，无需先上报用量或生成账单；即使中间若干月没有调用服务，
 // 再次进入时也会在此一次性补齐，当前条件仍正确。调用时持有 s.mu。
 func (s *Service) applyDueChangesLocked(acc *account, now time.Time) {
-	sub := acc.sub
+	sub := acc.currentSub()
 	if sub == nil {
 		return
 	}
@@ -194,6 +255,12 @@ func (s *Service) applyDueChangesLocked(acc *account, now time.Time) {
 		sub.planID = sub.pending.TargetPlanID
 		sub.terms = sub.pending.Terms
 		sub.pending = nil
+	}
+	// 取消时刻到达即终止订阅：终止时刻不计入订阅期间。
+	if !sub.cancelAt.IsZero() && !now.Before(sub.cancelAt) {
+		sub.terminatedAt = sub.cancelAt
+		sub.pending = nil
+		sub.cancelAt = time.Time{}
 	}
 }
 
@@ -221,8 +288,9 @@ func termsForPeriodLocked(sub *subRecord, period Month) PlanTerms {
 // 不重新取价（Created 为 false）；安排另一目标套餐则替换原安排，生效月份仍为
 // 本次请求被接受时的下一月。欠费停用期间也可以安排。
 //
+// 等待取消期间（已申请取消但尚未到终止时刻）拒绝新换套餐安排。
 // 账户不存在、尚未开通订阅、开通时刻尚未到达、目标套餐不存在、目标套餐与当前
-// 生效套餐相同时请求失败，原有安排保持不变。
+// 生效套餐相同或订阅正在取消中时请求失败，原有安排保持不变。
 func (s *Service) SchedulePlanChange(accountID, targetPlanID string) (PlanChangeResult, error) {
 	if accountID == "" {
 		return PlanChangeResult{}, invalidf("account id is empty")
@@ -237,27 +305,32 @@ func (s *Service) SchedulePlanChange(accountID, targetPlanID string) (PlanChange
 	if !ok {
 		return PlanChangeResult{}, ErrAccountNotFound
 	}
-	if acc.sub == nil {
-		return PlanChangeResult{}, ErrSubscriptionNotFound
-	}
 	now := s.nowUTC()
-	if now.Before(acc.sub.activatedAt) {
-		return PlanChangeResult{}, ErrSubscriptionNotActivated
-	}
 	// 先让已到期的安排生效：例如跨月后的首次调用，此时“当前套餐”已是新套餐。
 	s.applyDueChangesLocked(acc, now)
+	sub := acc.currentSub()
+	if sub == nil {
+		return PlanChangeResult{}, ErrSubscriptionNotFound
+	}
+	if now.Before(sub.activatedAt) {
+		return PlanChangeResult{}, ErrSubscriptionNotActivated
+	}
+	// 等待取消期间拒绝新换套餐安排。
+	if !sub.cancelAt.IsZero() && now.Before(sub.cancelAt) {
+		return PlanChangeResult{}, ErrSubscriptionCancelling
+	}
 
 	plan, ok := s.plans[targetPlanID]
 	if !ok {
 		return PlanChangeResult{}, ErrPlanNotFound
 	}
-	if targetPlanID == acc.sub.planID {
+	if targetPlanID == sub.planID {
 		return PlanChangeResult{}, ErrPlanChangeSamePlan
 	}
 
 	// 已有安排且目标相同：原样返回，不重新取价。
-	if acc.sub.pending != nil && acc.sub.pending.TargetPlanID == targetPlanID {
-		return PlanChangeResult{Created: false, Change: *acc.sub.pending}, nil
+	if sub.pending != nil && sub.pending.TargetPlanID == targetPlanID {
+		return PlanChangeResult{Created: false, Change: *sub.pending}, nil
 	}
 
 	change := PlanChange{
@@ -265,14 +338,14 @@ func (s *Service) SchedulePlanChange(accountID, targetPlanID string) (PlanChange
 		Terms:           termsOf(plan),
 		EffectivePeriod: nextMonth(MonthOf(now)),
 	}
-	acc.sub.pending = &change
+	sub.pending = &change
 	return PlanChangeResult{Created: true, Change: change}, nil
 }
 
 // CancelPlanChange 在安排生效前取消它，取消后账户继续沿用当前套餐。
 // 没有待生效安排时取消也成功；已生效的切换不会被撤回。
 // 欠费停用期间也可以取消，取消不清除欠费、不解除停用。
-// 账户不存在或尚未开通订阅时失败。
+// 账户不存在或没有有效订阅时失败。
 func (s *Service) CancelPlanChange(accountID string) error {
 	if accountID == "" {
 		return invalidf("account id is empty")
@@ -283,22 +356,119 @@ func (s *Service) CancelPlanChange(accountID string) error {
 	if !ok {
 		return ErrAccountNotFound
 	}
-	if acc.sub == nil {
-		return ErrSubscriptionNotFound
-	}
 	// 已到生效月份月初零点的安排视为已生效，不可撤回。
 	s.applyDueChangesLocked(acc, s.nowUTC())
-	acc.sub.pending = nil
+	sub := acc.currentSub()
+	if sub == nil {
+		return ErrSubscriptionNotFound
+	}
+	sub.pending = nil
+	return nil
+}
+
+// CancelSubscription 为有效订阅申请按月取消。
+//
+// 订阅已生效时提交取消，以请求时刻的下一个 UTC 自然月月初为终止时刻并返回该时刻；
+// 当月照常接收用量，按完整月费和额度计费，不按天退款。
+// 欠费停用不妨碍取消，也不免除债务。
+// 同一订阅重复取消始终返回原终止时刻，不把期限后移。
+// 取消成功时清除尚未生效的换套餐安排；等待取消期间拒绝新换套餐安排。
+// 若请求恰在换套餐生效的月初，应先承认该次切换，取消从再下一月生效。
+// 账户不存在、没有有效订阅或开通时刻尚未到达时失败。
+func (s *Service) CancelSubscription(accountID string) (time.Time, error) {
+	if accountID == "" {
+		return time.Time{}, invalidf("account id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return time.Time{}, ErrAccountNotFound
+	}
+	now := s.nowUTC()
+	currentMonth := MonthOf(now)
+	atMonthStart := now.Equal(currentMonth.Start())
+
+	sub := acc.currentSub()
+	if sub == nil {
+		return time.Time{}, ErrSubscriptionNotFound
+	}
+	if now.Before(sub.activatedAt) {
+		return time.Time{}, ErrSubscriptionNotActivated
+	}
+
+	// 若请求恰在换套餐生效的月初，先承认该次切换，取消从再下一月生效。
+	// 换套餐可能已被此前的查询调用落入条件历史，因此同时检查条件历史末条。
+	hadChangeDueNow := false
+	if sub.pending != nil && currentMonth.Equal(sub.pending.EffectivePeriod) {
+		hadChangeDueNow = true
+	}
+	if len(sub.termsHistory) > 1 && currentMonth.Equal(sub.termsHistory[len(sub.termsHistory)-1].effective) {
+		hadChangeDueNow = true
+	}
+	s.applyDueChangesLocked(acc, now)
+	// applyDueChangesLocked 后 sub 指针仍指向当前订阅记录。
+
+	// 同一订阅重复取消始终返回原终止时刻，不把期限后移。
+	if !sub.cancelAt.IsZero() {
+		return sub.cancelAt, nil
+	}
+
+	cancelMonth := nextMonth(currentMonth)
+	if atMonthStart && hadChangeDueNow {
+		cancelMonth = nextMonth(cancelMonth)
+	}
+	cancelAt := cancelMonth.Start()
+
+	// 取消成功时清除尚未生效的换套餐安排。
+	sub.pending = nil
+	sub.cancelAt = cancelAt
+	return cancelAt, nil
+}
+
+// WithdrawCancellation 撤回尚未生效的取消安排。
+//
+// 生效前可撤回；有效订阅没有取消安排时撤回也成功；终止后撤回失败。
+// 撤回取消不恢复被清除的换套餐安排。
+// 账户不存在或没有有效订阅时失败。
+func (s *Service) WithdrawCancellation(accountID string) error {
+	if accountID == "" {
+		return invalidf("account id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return ErrAccountNotFound
+	}
+	now := s.nowUTC()
+	// 先让已到期的取消生效：若已到终止时刻，订阅已终止，撤回失败。
+	s.applyDueChangesLocked(acc, now)
+	sub := acc.currentSub()
+	if sub == nil {
+		return ErrSubscriptionNotFound
+	}
+	// 没有取消安排时撤回也成功。
+	if sub.cancelAt.IsZero() {
+		return nil
+	}
+	// 已到终止时刻：撤回失败。
+	if !now.Before(sub.cancelAt) {
+		return ErrSubscriptionNotFound
+	}
+	sub.cancelAt = time.Time{}
 	return nil
 }
 
 // RecordEvent 上报一条用量事件。
 //
-// 事件按发生时刻归入 UTC 自然月账期；早于订阅开通或晚于当前时刻的事件被拒绝。
-// 事件标识在同一账户内去重：完全相同的重报返回原结果且不重复累计，
+// 事件按发生时刻归入 UTC 自然月账期；必须属于某段实际订阅期间：
+// 开通时刻计入、终止时刻不计入，空档期间拒绝。早于首次开通或晚于当前时刻的
+// 事件拒绝。事件标识在同一账户内去重：完全相同的重报返回原结果且不重复累计，
 // 相同标识但时刻或数量不同返回 ErrEventConflict。
 // 已出账月份拒绝新事件；账户因到期欠费停用时拒绝新事件；
 // 但此前已接收事件的完全相同重报始终成功。
+// 终止后仍允许补报旧订阅期间且尚未出账的用量，但到期欠费时仍拒绝新增。
 func (s *Service) RecordEvent(e Event) (EventResult, error) {
 	if e.AccountID == "" {
 		return EventResult{}, invalidf("account id is empty")
@@ -321,14 +491,14 @@ func (s *Service) RecordEvent(e Event) (EventResult, error) {
 	if !ok {
 		return EventResult{}, ErrAccountNotFound
 	}
-	if acc.sub == nil {
+	if len(acc.subs) == 0 {
 		return EventResult{}, ErrSubscriptionNotFound
 	}
 
-	// 进入即补齐已到期的换套餐安排，保证并发下各操作观察到一致的当前套餐。
+	// 进入即补齐已到期的换套餐安排与取消，保证并发下各操作观察到一致的状态。
 	s.applyDueChangesLocked(acc, s.nowUTC())
 
-	// 去重优先：完全相同的重报即使发生在出账后或停用期间也返回成功。
+	// 去重优先：完全相同的重报即使发生在出账后、停用期间或终止后也返回成功。
 	if prev, ok := acc.events[e.EventID]; ok {
 		if !prev.at.Equal(at) || prev.qty != e.Quantity {
 			return EventResult{}, ErrEventConflict
@@ -336,8 +506,13 @@ func (s *Service) RecordEvent(e Event) (EventResult, error) {
 		return EventResult{Accepted: false, Period: prev.period}, nil
 	}
 
-	if at.Before(acc.sub.activatedAt) {
-		return EventResult{}, ErrEventBeforeSubscription
+	// 事件必须属于某段实际订阅期间：开通时刻计入、终止时刻不计入。
+	sub := acc.subCovering(at)
+	if sub == nil {
+		if at.Before(acc.subs[0].activatedAt) {
+			return EventResult{}, ErrEventBeforeSubscription
+		}
+		return EventResult{}, ErrEventOutsideSubscription
 	}
 	now := s.nowUTC()
 	if at.After(now) {
@@ -363,8 +538,9 @@ func (s *Service) RecordEvent(e Event) (EventResult, error) {
 }
 
 // CreateBill 为账户指定账期生成账单（账期不存在则幂等返回同一张）。
-// 只能为开通当月及以后、且已经结束的月份生成账单。
+// 只能为有订阅覆盖、且已经结束的月份生成账单；完全无订阅的月份出账失败。
 // 重复调用得到同一账单；出账后金额与用量明细固定。
+// 旧订阅覆盖的已结束月份仍可出账，使用各月当时锁定的条件。
 func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 	if accountID == "" {
 		return Bill{}, invalidf("account id is empty")
@@ -379,19 +555,19 @@ func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 	if !ok {
 		return Bill{}, ErrAccountNotFound
 	}
-	if acc.sub == nil {
+	if len(acc.subs) == 0 {
 		return Bill{}, ErrSubscriptionNotFound
 	}
 	if existing, ok := acc.bills[period]; ok {
 		return existing.bill, nil
 	}
 
-	// 补齐到期安排（条件历史），随后按账期取该月当时适用的条件：
+	// 补齐到期安排（条件历史）与取消，随后按账期取该月当时适用的条件：
 	// 即使已经换过套餐或先出新月份账单再补旧月份账单，历史账单也不会被当前套餐覆盖。
 	s.applyDueChangesLocked(acc, s.nowUTC())
 
-	activationMonth := MonthOf(acc.sub.activatedAt)
-	if period.Before(activationMonth) {
+	sub := acc.subForPeriod(period)
+	if sub == nil {
 		return Bill{}, ErrBillBeforeSubscription
 	}
 	now := s.nowUTC()
@@ -399,7 +575,7 @@ func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 		return Bill{}, ErrBillMonthNotEnded
 	}
 
-	terms := termsForPeriodLocked(acc.sub, period)
+	terms := termsForPeriodLocked(sub, period)
 	bill, err := buildBill(accountID, period, terms, acc.usage[period])
 	if err != nil {
 		return Bill{}, err
@@ -508,6 +684,7 @@ func (s *Service) MonthlyUsage(accountID string, period Month) (Usage, error) {
 }
 
 // Status 返回账户状态：各月累计用量、各账单余额以及当前是否因欠费停用。
+// 等待取消时展示终止时刻；终止后无有效订阅、无当前套餐及待切换，历史用量与账单继续可查。
 func (s *Service) Status(accountID string) (AccountStatus, error) {
 	if accountID == "" {
 		return AccountStatus{}, invalidf("account id is empty")
@@ -536,17 +713,19 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 	}
 	sortMonths(periods)
 
+	sub := acc.currentSub()
 	st := AccountStatus{
 		AccountID:    accountID,
-		Subscribed:   acc.sub != nil,
+		Subscribed:   sub != nil,
 		Suspended:    s.isSuspendedLocked(acc, now),
 		MonthlyUsage: make([]Usage, 0, len(periods)),
 		Bills:        make([]BillSummary, 0, len(acc.bills)),
 	}
-	if acc.sub != nil {
-		st.CurrentTerms = acc.sub.terms
-		if acc.sub.pending != nil {
-			pending := *acc.sub.pending
+	if sub != nil {
+		st.CurrentTerms = sub.terms
+		st.CancelAt = sub.cancelAt
+		if sub.pending != nil {
+			pending := *sub.pending
 			st.PendingChange = &pending
 		}
 	}

@@ -28,6 +28,10 @@ var (
 	ErrSubscriptionNotFound = errors.New("meter: subscription not found")
 	// ErrSubscriptionNotActivated 订阅开通时刻尚未到达。
 	ErrSubscriptionNotActivated = errors.New("meter: subscription not activated")
+	// ErrReactivationTooEarly 重新开通时刻早于上次终止时刻。
+	ErrReactivationTooEarly = errors.New("meter: reactivation time before last termination")
+	// ErrSubscriptionCancelling 订阅正在取消中，拒绝新换套餐安排。
+	ErrSubscriptionCancelling = errors.New("meter: subscription is being cancelled")
 	// ErrPlanChangeSamePlan 换套餐安排的目标套餐与当前生效套餐相同。
 	ErrPlanChangeSamePlan = errors.New("meter: plan change target is current plan")
 	// ErrPlanChangeNotFound 没有待生效的换套餐安排。
@@ -35,8 +39,10 @@ var (
 
 	// ErrEventConflict 事件标识相同但时刻或数量不同。
 	ErrEventConflict = errors.New("meter: event conflict")
-	// ErrEventBeforeSubscription 事件发生时刻早于订阅开通时刻。
+	// ErrEventBeforeSubscription 事件发生时刻早于首次订阅开通时刻。
 	ErrEventBeforeSubscription = errors.New("meter: event before subscription")
+	// ErrEventOutsideSubscription 事件发生时刻不在任何订阅期间内（空档期）。
+	ErrEventOutsideSubscription = errors.New("meter: event outside subscription period")
 	// ErrEventInFuture 事件发生时刻晚于当前时刻。
 	ErrEventInFuture = errors.New("meter: event in the future")
 	// ErrMonthBilled 该账期已出账，拒绝首次出现的新事件。
