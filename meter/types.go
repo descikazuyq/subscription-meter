@@ -67,6 +67,22 @@ type PlanChangeResult struct {
 	Change PlanChange
 }
 
+// SubscriptionCancellation 是一次按月取消订阅安排。
+type SubscriptionCancellation struct {
+	// EndAt 终止时刻（UTC）：取消请求时刻的下一个 UTC 自然月月初零点。
+	// 终止时刻计入空档，不计入订阅期间。
+	EndAt time.Time
+}
+
+// CancelSubscriptionResult 是取消订阅请求的结果。
+type CancelSubscriptionResult struct {
+	// Cancelled 为 true 表示本次新登记了取消安排；
+	// 为 false 表示此前已安排取消，本次原样返回原终止时刻，不后移期限。
+	Cancelled bool
+	// Cancellation 取消安排内容。
+	Cancellation SubscriptionCancellation
+}
+
 // termsEntry 是订阅条件历史中的一条：自 EffectivePeriod（含）起适用 Terms。
 type termsEntry struct {
 	effective Month
@@ -192,15 +208,21 @@ type Usage struct {
 // AccountStatus 是账户当前状态查询结果。
 type AccountStatus struct {
 	AccountID string
-	// Subscribed 是否已开通订阅。
+	// Subscribed 当前是否有有效订阅（含已安排取消、尚未到终止时刻的等待期）。
+	// 到达终止时刻后即使没有上报用量或生成账单，也立即变为 false。
 	Subscribed bool
-	// Suspended 是否因到期欠费被停用（结清全部到期欠费账单后恢复）。
+	// Suspended 是否因到期欠费被停用（结清全部到期欠费账单后恢复；
+	// 结清债务只解除停用，不复活已取消的订阅）。
 	Suspended bool
-	// CurrentTerms 当前账期实际生效的套餐条件；未开通订阅时为零值。
+	// CurrentTerms 当前账期实际生效的套餐条件；无有效订阅时为零值。
 	// 到达生效月份月初零点后，无需任何操作即为换套餐后的条件。
 	CurrentTerms PlanTerms
 	// PendingChange 尚未生效的换套餐安排；没有安排时为 nil。
+	// 登记取消时会清除待生效安排，等待取消期间拒绝新安排。
 	PendingChange *PlanChange
+	// ScheduledEnd 已安排的订阅终止时刻（下一个 UTC 自然月月初）；
+	// 未安排取消或终止已发生时为 nil。等待取消期间 Subscribed 仍为 true。
+	ScheduledEnd *time.Time
 	// MonthlyUsage 各账期累计用量，按账期先后排列。
 	MonthlyUsage []Usage
 	// Bills 已生成账单的余额与付清状态，按账期先后排列。

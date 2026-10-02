@@ -32,6 +32,10 @@ var (
 	ErrPlanChangeSamePlan = errors.New("meter: plan change target is current plan")
 	// ErrPlanChangeNotFound 没有待生效的换套餐安排。
 	ErrPlanChangeNotFound = errors.New("meter: plan change not found")
+	// ErrPlanChangeWhileCancelling 等待取消期间拒绝新的换套餐安排。
+	ErrPlanChangeWhileCancelling = errors.New("meter: plan change rejected while cancellation pending")
+	// ErrResubscribeBeforeEnd 重新开通时刻早于上次订阅终止时刻。
+	ErrResubscribeBeforeEnd = errors.New("meter: resubscribe before previous end time")
 
 	// ErrEventConflict 事件标识相同但时刻或数量不同。
 	ErrEventConflict = errors.New("meter: event conflict")
