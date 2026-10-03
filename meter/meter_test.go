@@ -680,6 +680,155 @@ func TestOverflowLeavesNoTrace(t *testing.T) {
 	_ = clk
 }
 
+// TestLargeAmountBillExactTax 保障大金额出账：月费与超额费用很大、但税额与应付
+// 总额仍落在非负 int64 范围内时，账户正常出账，金额按分精确计算——
+// 不因计税中间乘积（税前费用直接乘税率）超过 int64 而误报溢出，
+// 也不因精度损失少收或多收。税额对月费与超额费用之和计算一次，
+// 按万分比四舍五入到分，恰好半分向上。
+func TestLargeAmountBillExactTax(t *testing.T) {
+	cases := []struct {
+		name         string
+		monthlyFee   int64
+		included     int64
+		overagePrice int64
+		rate         int64
+		usage        int64 // 账期内单次事件上报的总用量
+		wantOverFee  int64
+		wantTax      int64
+		wantDue      int64
+	}{
+		// 税前 8000000000000000005 分、税率 1000：税额恰为 800000000000000000.5，
+		// 半分向上得 800000000000000001。税前直接乘税率（8e21）远超 int64，
+		// 但最终税额与应付总额均合法，不得误报溢出。
+		{"half-up-exact", 8000000000000000005, 10, 0, 1000, 5, 0, 800000000000000001, 8800000000000000006},
+		// 相邻金额：税额 800000000000000000.4，不足半分舍去。
+		{"just-below-half", 8000000000000000004, 10, 0, 1000, 5, 0, 800000000000000000, 8800000000000000004},
+		// 相邻金额：税额 800000000000000000.6，超过半分进一分。
+		{"just-above-half", 8000000000000000006, 10, 0, 1000, 5, 0, 800000000000000001, 8800000000000000007},
+		// 月费与超额费用分别贡献税前金额：税额对两者之和计算一次。
+		// 若分别舍入再相加会得到 800000000000000000（少收 1 分）。
+		{"fee-plus-overage", 4000000000000000003, 0, 2, 1000, 2000000000000000001, 4000000000000000002, 800000000000000001, 8800000000000000006},
+		// 零税率：合法金额达到 int64 上限也正常出账，税额为零。
+		{"zero-rate-max", maxInt64, 0, 0, 0, 0, 0, 0, maxInt64},
+		// 零税率：月费与超额费用之和恰为 int64 上限。
+		{"zero-rate-max-combined", maxInt64 - 100, 0, 1, 0, 100, 100, 0, maxInt64},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, clk := newTestService(utc(2026, 1, 15, 12, 0))
+			mustPlan(t, s, Plan{ID: "p", MonthlyFee: c.monthlyFee, IncludedUnits: c.included, OveragePrice: c.overagePrice, TaxRateBasisPoints: c.rate})
+			mustAccount(t, s, "a")
+			if err := s.Subscribe("a", "p", utc(2026, 1, 10, 0, 0)); err != nil {
+				t.Fatal(err)
+			}
+			// 开通后修改套餐定义：账单仍按开通时锁定的条件计费。
+			if err := s.UpdatePlan(Plan{ID: "p", MonthlyFee: 1, IncludedUnits: 1, OveragePrice: 1, TaxRateBasisPoints: 1}); err != nil {
+				t.Fatal(err)
+			}
+			if c.usage > 0 {
+				if _, err := s.RecordEvent(Event{AccountID: "a", EventID: "u", At: utc(2026, 1, 12, 0, 0), Quantity: c.usage}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			clk.t = utc(2026, 2, 1, 0, 0)
+			b, err := s.CreateBill("a", jan(2026))
+			if err != nil {
+				t.Fatalf("create bill: %v", err)
+			}
+			// 计费明细：用量、额度与超额按该月锁定的单价计算。
+			var wantOverUnits int64
+			if c.usage > c.included {
+				wantOverUnits = c.usage - c.included
+			}
+			if b.TotalUsage != c.usage || b.IncludedUnits != c.included || b.OverageUnits != wantOverUnits {
+				t.Fatalf("usage: total=%d included=%d over=%d", b.TotalUsage, b.IncludedUnits, b.OverageUnits)
+			}
+			if b.MonthlyFee != c.monthlyFee || b.OverageFee != c.wantOverFee {
+				t.Fatalf("fees: fee=%d over=%d", b.MonthlyFee, b.OverageFee)
+			}
+			if b.Tax != c.wantTax || b.TotalDue != c.wantDue {
+				t.Fatalf("totals: tax=%d due=%d", b.Tax, b.TotalDue)
+			}
+			// 首次出账：已付为零，余额等于应付总额。
+			if b.Paid != 0 || b.Balance != c.wantDue || b.Settled {
+				t.Fatalf("initial balance: paid=%d bal=%d settled=%v", b.Paid, b.Balance, b.Settled)
+			}
+			if b.Terms != (PlanTerms{PlanID: "p", MonthlyFee: c.monthlyFee, IncludedUnits: c.included, OveragePrice: c.overagePrice, TaxRateBasisPoints: c.rate}) {
+				t.Fatalf("terms not snapshot: %+v", b.Terms)
+			}
+			if !b.DueAt.Equal(utc(2026, 2, 8, 0, 0)) {
+				t.Fatalf("due at = %v", b.DueAt)
+			}
+
+			// 查询入口拿到同一张完整账单。
+			got, err := s.GetBill("a", jan(2026))
+			if err != nil || got != b {
+				t.Fatalf("get bill: %+v %v", got, err)
+			}
+			st, err := s.Status("a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(st.Bills) != 1 || st.Bills[0].TotalDue != c.wantDue || st.Bills[0].Paid != 0 || st.Bills[0].Balance != c.wantDue || st.Bills[0].Settled {
+				t.Fatalf("status bill summary: %+v", st.Bills)
+			}
+			if u, _ := s.MonthlyUsage("a", jan(2026)); u.Total != c.usage {
+				t.Fatalf("usage = %d, want %d", u.Total, c.usage)
+			}
+		})
+	}
+}
+
+// TestLargeAmountBillOverflowLeavesNoTrace 保留真正超出金额范围的拒绝结果：
+// 费用或含税总额不能用非负 int64 表示时出账返回 ErrOverflow，
+// 该月仍没有账单，已记录的月用量保持原值。
+func TestLargeAmountBillOverflowLeavesNoTrace(t *testing.T) {
+	s, clk := newTestService(utc(2026, 1, 15, 12, 0))
+
+	// 税前费用与税额各自合法，但含税总额超出 int64：
+	// 月费 maxInt64，税率 1000，税额 922337203685477581。
+	mustPlan(t, s, Plan{ID: "p1", MonthlyFee: maxInt64, IncludedUnits: 0, OveragePrice: 0, TaxRateBasisPoints: 1000})
+	mustAccount(t, s, "a")
+	if err := s.Subscribe("a", "p1", utc(2026, 1, 10, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordEvent(Event{AccountID: "a", EventID: "u", At: utc(2026, 1, 12, 0, 0), Quantity: 7}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 月费与超额费用之和本身溢出：月费 maxInt64，超额 1 分。
+	mustPlan(t, s, Plan{ID: "p2", MonthlyFee: maxInt64, IncludedUnits: 0, OveragePrice: 1, TaxRateBasisPoints: 0})
+	mustAccount(t, s, "b")
+	if err := s.Subscribe("b", "p2", utc(2026, 1, 10, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordEvent(Event{AccountID: "b", EventID: "u", At: utc(2026, 1, 12, 0, 0), Quantity: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	clk.t = utc(2026, 2, 1, 0, 0)
+	for _, id := range []string{"a", "b"} {
+		if _, err := s.CreateBill(id, jan(2026)); !errors.Is(err, ErrOverflow) {
+			t.Fatalf("%s: expected overflow, got %v", id, err)
+		}
+		// 重复出账仍是溢出，不留下部分账单。
+		if _, err := s.CreateBill(id, jan(2026)); !errors.Is(err, ErrOverflow) {
+			t.Fatalf("%s: retry expected overflow, got %v", id, err)
+		}
+		if _, err := s.GetBill(id, jan(2026)); !errors.Is(err, ErrBillNotFound) {
+			t.Fatalf("%s: partial bill left behind: %v", id, err)
+		}
+	}
+	// 出账失败不改变已记录的月用量。
+	if u, _ := s.MonthlyUsage("a", jan(2026)); u.Total != 7 {
+		t.Fatalf("a usage after overflow = %d, want 7", u.Total)
+	}
+	if u, _ := s.MonthlyUsage("b", jan(2026)); u.Total != 1 {
+		t.Fatalf("b usage after overflow = %d, want 1", u.Total)
+	}
+}
+
 func TestConcurrentDuplicates(t *testing.T) {
 	s, clk := newTestService(utc(2026, 2, 1, 0, 0))
 	mustPlan(t, s, Plan{ID: "p", MonthlyFee: 1000, IncludedUnits: 5, OveragePrice: 10, TaxRateBasisPoints: 1000})
