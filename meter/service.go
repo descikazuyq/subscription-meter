@@ -44,6 +44,10 @@ type billRecord struct {
 type paymentRecord struct {
 	period Month
 	amount int64
+	// balance 与 settled 是本笔付款首次成功登记完成时账单的余额与付清状态。
+	// 完全相同的重报原样返回该历史结果，不随后续付款或账单当前状态变化。
+	balance int64
+	settled bool
 }
 
 type account struct {
@@ -582,8 +586,13 @@ func (s *Service) GetBill(accountID string, period Month) (Bill, error) {
 }
 
 // RecordPayment 为指定账单登记一笔大于零且不超过余额的本地付款，支持分次登记。
-// 付款标识在同一账户内去重：相同账单和金额的重报返回原结果，
-// 改成其他账单或金额返回 ErrPaymentConflict；失败不消耗付款标识。
+// 付款标识在同一账户内去重：相同账单和金额的重报仍成功，但本次不再登记
+// （Registered 为 false），也不再次增加已付金额；返回的付款内容、账单余额与
+// 付清状态均为该笔付款首次成功登记完成时的历史结果，不随后续付款或账单当前
+// 状态变化（例如账单后来已结清，重报早先的部分付款仍返回当时的未清余额与
+// 未付清）。账单查询与账户状态中的余额始终反映当前状态，不受重报影响。
+// 相同标识但账期或金额不同返回 ErrPaymentConflict：即使原账单已结清，或改指
+// 向的账期还没有账单，也按冲突处理而非当作新付款。失败不消耗付款标识。
 func (s *Service) RecordPayment(accountID, paymentID string, period Month, amount int64) (PaymentResult, error) {
 	if accountID == "" {
 		return PaymentResult{}, invalidf("account id is empty")
@@ -606,15 +615,14 @@ func (s *Service) RecordPayment(accountID, paymentID string, period Month, amoun
 		if prev.period != period || prev.amount != amount {
 			return PaymentResult{}, ErrPaymentConflict
 		}
-		rec, ok := acc.bills[period]
-		if !ok {
-			return PaymentResult{}, ErrBillNotFound
-		}
+		// 完全相同的重报仍成功，但不再次登记、不改变账单：
+		// 返回这笔付款首次成功登记完成时的余额与付清状态，
+		// 不受账单后续收款、当前余额或停用/恢复状态影响。
 		return PaymentResult{
 			Registered:  false,
 			Payment:     Payment{AccountID: accountID, PaymentID: paymentID, Period: period, Amount: amount},
-			BillBalance: rec.bill.Balance,
-			Settled:     rec.bill.Settled,
+			BillBalance: prev.balance,
+			Settled:     prev.settled,
 		}, nil
 	}
 
@@ -636,7 +644,13 @@ func (s *Service) RecordPayment(accountID, paymentID string, period Month, amoun
 	if rec.bill.Balance == 0 {
 		rec.bill.Settled = true
 	}
-	acc.payments[paymentID] = paymentRecord{period: period, amount: amount}
+	// 保存首次登记完成时的历史结果，供完全相同重报原样返回。
+	acc.payments[paymentID] = paymentRecord{
+		period:  period,
+		amount:  amount,
+		balance: rec.bill.Balance,
+		settled: rec.bill.Settled,
+	}
 
 	return PaymentResult{
 		Registered:  true,

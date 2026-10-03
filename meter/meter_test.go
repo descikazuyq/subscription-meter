@@ -360,6 +360,174 @@ func TestPaymentsPartialAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestPaymentReplayReturnsHistoricalResult(t *testing.T) {
+	s, clk := newTestService(utc(2026, 2, 1, 0, 0))
+	mustPlan(t, s, Plan{ID: "p", MonthlyFee: 1000, IncludedUnits: 0, OveragePrice: 0, TaxRateBasisPoints: 0})
+	mustAccount(t, s, "a")
+	if err := s.Subscribe("a", "p", utc(2026, 1, 1, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateBill("a", jan(2026)); err != nil {
+		t.Fatal(err)
+	}
+
+	// p1 首次支付 400：余额 600，未付清。
+	r1, err := s.RecordPayment("a", "p1", jan(2026), 400)
+	if err != nil || !r1.Registered || r1.BillBalance != 600 || r1.Settled {
+		t.Fatalf("p1 first: %+v %v", r1, err)
+	}
+	// p2 支付剩余 600：账单当前余额 0，已付清。
+	r2, err := s.RecordPayment("a", "p2", jan(2026), 600)
+	if err != nil || !r2.Registered || r2.BillBalance != 0 || !r2.Settled {
+		t.Fatalf("p2: %+v %v", r2, err)
+	}
+
+	// 原样重报 p1：不再登记，返回首次登记时的历史结果。
+	r1b, err := s.RecordPayment("a", "p1", jan(2026), 400)
+	if err != nil {
+		t.Fatalf("p1 replay: %v", err)
+	}
+	if r1b.Registered {
+		t.Fatalf("p1 replay should not register again: %+v", r1b)
+	}
+	if r1b.Payment.Amount != 400 || r1b.Payment.Period != jan(2026) || r1b.Payment.PaymentID != "p1" {
+		t.Fatalf("p1 replay payment content: %+v", r1b.Payment)
+	}
+	if r1b.BillBalance != 600 || r1b.Settled {
+		t.Fatalf("p1 replay historical result: balance=%d settled=%v, want 600/false", r1b.BillBalance, r1b.Settled)
+	}
+	// 原样重报 p2：历史结果为余额 0、已付清。
+	r2b, err := s.RecordPayment("a", "p2", jan(2026), 600)
+	if err != nil || r2b.Registered || r2b.BillBalance != 0 || !r2b.Settled {
+		t.Fatalf("p2 replay: %+v %v", r2b, err)
+	}
+
+	// 重报不再次增加已付金额；账单查询仍显示当前状态：已付 1000、余额 0、已付清。
+	b, err := s.GetBill("a", jan(2026))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Paid != 1000 || b.Balance != 0 || !b.Settled {
+		t.Fatalf("bill current state after replays: paid=%d balance=%d settled=%v", b.Paid, b.Balance, b.Settled)
+	}
+	if b.TotalUsage != 0 || b.TotalDue != 1000 || b.Tax != 0 {
+		t.Fatalf("bill amounts changed: %+v", b)
+	}
+	st, err := s.Status("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Bills) != 1 || st.Bills[0].Paid != 1000 || st.Bills[0].Balance != 0 || !st.Bills[0].Settled {
+		t.Fatalf("status bill summary: %+v", st.Bills)
+	}
+
+	// 即使已过截止时刻，账户已因结清恢复，不能因旧付款结果显示未付清而重新停用。
+	clk.t = utc(2026, 2, 8, 0, 0)
+	st, _ = s.Status("a")
+	if st.Suspended {
+		t.Fatalf("account re-suspended by historical unpaid replay: %+v", st)
+	}
+	if _, err := s.RecordPayment("a", "p1", jan(2026), 400); err != nil {
+		t.Fatalf("p1 replay after due: %v", err)
+	}
+	st, _ = s.Status("a")
+	if st.Suspended {
+		t.Fatalf("suspended after replay post-due: %+v", st)
+	}
+}
+
+func TestPaymentReplayAfterLaterPartialPayment(t *testing.T) {
+	s, _ := newTestService(utc(2026, 2, 1, 0, 0))
+	mustPlan(t, s, Plan{ID: "p", MonthlyFee: 1000, IncludedUnits: 0, OveragePrice: 0, TaxRateBasisPoints: 0})
+	mustAccount(t, s, "a")
+	if err := s.Subscribe("a", "p", utc(2026, 1, 1, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateBill("a", jan(2026)); err != nil {
+		t.Fatal(err)
+	}
+	// p1 付 400（余额 600），后续 p2 只付部分余额 300（当前余额 300，未付清）。
+	if _, err := s.RecordPayment("a", "p1", jan(2026), 400); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := s.RecordPayment("a", "p2", jan(2026), 300); err != nil || r.BillBalance != 300 || r.Settled {
+		t.Fatalf("p2 partial: %+v %v", r, err)
+	}
+	// 重报 p1 与 p2 均返回各自首次登记时的结果。
+	r1, err := s.RecordPayment("a", "p1", jan(2026), 400)
+	if err != nil || r1.Registered || r1.BillBalance != 600 || r1.Settled {
+		t.Fatalf("p1 replay: %+v %v", r1, err)
+	}
+	r2, err := s.RecordPayment("a", "p2", jan(2026), 300)
+	if err != nil || r2.Registered || r2.BillBalance != 300 || r2.Settled {
+		t.Fatalf("p2 replay: %+v %v", r2, err)
+	}
+	// 当前余额不被重报改变。
+	if b, _ := s.GetBill("a", jan(2026)); b.Paid != 700 || b.Balance != 300 {
+		t.Fatalf("bill state: paid=%d balance=%d", b.Paid, b.Balance)
+	}
+}
+
+func TestPaymentConflictAfterSettledAndMissingBill(t *testing.T) {
+	s, _ := newTestService(utc(2026, 2, 1, 0, 0))
+	mustPlan(t, s, Plan{ID: "p", MonthlyFee: 1000, IncludedUnits: 0, OveragePrice: 0, TaxRateBasisPoints: 0})
+	mustAccount(t, s, "a")
+	if err := s.Subscribe("a", "p", utc(2026, 1, 1, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateBill("a", jan(2026)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RecordPayment("a", "p1", jan(2026), 1000); err != nil {
+		t.Fatal(err)
+	}
+	// 原账单已结清：相同标识改金额仍是冲突，不能当作新付款。
+	if _, err := s.RecordPayment("a", "p1", jan(2026), 1); !errors.Is(err, ErrPaymentConflict) {
+		t.Fatalf("amount conflict on settled bill: %v", err)
+	}
+	// 改指向尚无账单的账期：仍是冲突而非 ErrBillNotFound。
+	if _, err := s.RecordPayment("a", "p1", feb(2026), 1); !errors.Is(err, ErrPaymentConflict) {
+		t.Fatalf("period conflict to missing bill: %v", err)
+	}
+	// 完全相同的重报即使原金额已超过当前余额（当前为 0）仍成功，且不再加已付。
+	r, err := s.RecordPayment("a", "p1", jan(2026), 1000)
+	if err != nil || r.Registered || r.BillBalance != 0 || !r.Settled {
+		t.Fatalf("identical replay on settled bill: %+v %v", r, err)
+	}
+	if b, _ := s.GetBill("a", jan(2026)); b.Paid != 1000 {
+		t.Fatalf("paid changed after replay: %d", b.Paid)
+	}
+}
+
+func TestFailedPaymentDoesNotConsumeID(t *testing.T) {
+	s, _ := newTestService(utc(2026, 2, 1, 0, 0))
+	mustPlan(t, s, Plan{ID: "p", MonthlyFee: 1000, IncludedUnits: 0, OveragePrice: 0, TaxRateBasisPoints: 0})
+	mustAccount(t, s, "a")
+	if err := s.Subscribe("a", "p", utc(2026, 1, 1, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateBill("a", jan(2026)); err != nil {
+		t.Fatal(err)
+	}
+	// 超额付款失败：不占用标识、不改变账单。
+	if _, err := s.RecordPayment("a", "p1", jan(2026), 1001); !errors.Is(err, ErrPaymentExceedsBalance) {
+		t.Fatalf("overpay: %v", err)
+	}
+	// 之后以同一标识提交合法付款，得到首次成功登记的结果。
+	r, err := s.RecordPayment("a", "p1", jan(2026), 400)
+	if err != nil || !r.Registered || r.BillBalance != 600 || r.Settled {
+		t.Fatalf("first success after failed attempt: %+v %v", r, err)
+	}
+	if b, _ := s.GetBill("a", jan(2026)); b.Paid != 400 {
+		t.Fatalf("bill paid after failed+success: %d", b.Paid)
+	}
+	// 重报返回历史结果。
+	r2, err := s.RecordPayment("a", "p1", jan(2026), 400)
+	if err != nil || r2.Registered || r2.BillBalance != 600 || r2.Settled {
+		t.Fatalf("replay: %+v %v", r2, err)
+	}
+}
+
 func TestZeroAmountBillSettled(t *testing.T) {
 	s, clk := newTestService(utc(2026, 2, 1, 0, 0))
 	mustPlan(t, s, Plan{ID: "p", MonthlyFee: 0, IncludedUnits: 100, OveragePrice: 1, TaxRateBasisPoints: 0})
