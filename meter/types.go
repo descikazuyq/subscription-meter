@@ -208,20 +208,23 @@ type Usage struct {
 // AccountStatus 是账户当前状态查询结果。
 type AccountStatus struct {
 	AccountID string
-	// Subscribed 当前是否有有效订阅（含已安排取消、尚未到终止时刻的等待期）。
-	// 到达终止时刻后即使没有上报用量或生成账单，也立即变为 false。
+	// Subscribed 当前是否有已实际生效的订阅（含已安排取消、尚未到终止时刻的
+	// 等待期）。已登记但开通时刻尚未到达的订阅不计入：到达终止时刻后即使没有
+	// 上报用量或生成账单，也立即变为 false。
 	Subscribed bool
 	// Suspended 是否因到期欠费被停用（结清全部到期欠费账单后恢复；
 	// 结清债务只解除停用，不复活已取消的订阅）。
 	Suspended bool
-	// CurrentTerms 当前账期实际生效的套餐条件；无有效订阅时为零值。
-	// 到达生效月份月初零点后，无需任何操作即为换套餐后的条件。
+	// CurrentTerms 当前账期实际生效的套餐条件；无已生效订阅（含已登记但开通
+	// 时刻尚未到达）时为零值。到达生效月份月初零点后，无需任何操作即为换套餐
+	// 后的条件。
 	CurrentTerms PlanTerms
-	// PendingChange 尚未生效的换套餐安排；没有安排时为 nil。
+	// PendingChange 尚未生效的换套餐安排；没有安排或订阅尚未生效时为 nil。
 	// 登记取消时会清除待生效安排，等待取消期间拒绝新安排。
 	PendingChange *PlanChange
 	// ScheduledEnd 已安排的订阅终止时刻（下一个 UTC 自然月月初）；
-	// 未安排取消或终止已发生时为 nil。等待取消期间 Subscribed 仍为 true。
+	// 未安排取消、终止已发生或订阅尚未生效时为 nil。等待取消期间
+	// Subscribed 仍为 true。
 	ScheduledEnd *time.Time
 	// MonthlyUsage 各账期累计用量，按账期先后排列。
 	MonthlyUsage []Usage

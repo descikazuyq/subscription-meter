@@ -147,6 +147,14 @@ func (s *Service) UpdatePlan(p Plan) error {
 // 每个账户只允许一份有效订阅；从 activatedAt 起接收用量，
 // 首月仍收完整月费并提供完整额度。
 //
+// activatedAt 可以是尚未到达的未来时刻：订阅被提前登记但尚未生效。未生效期间
+// Status 显示未订阅（Subscribed 为 false、当前条件为零值），再次开通仍按已有
+// 订阅拒绝，安排换套餐与登记取消返回 ErrSubscriptionNotActivated；这些查询与
+// 失败请求既不会删除也不会提前激活登记。到达 activatedAt（以该时刻为界，按
+// UTC 瞬间比较，不按开通月份提前生效）后订阅自动生效，无需上报用量、安排换
+// 套餐或生成账单，且使用登记时保存的套餐条件快照，等待期间修改套餐定义不影响
+// 随后生效的条件。
+//
 // 订阅终止（按月取消到达终止时刻）后可用本入口重新开通：activatedAt 不得早于
 // 上一段订阅的终止时刻；重新开通保存当时的套餐条件，当月仍收完整月费、给完整
 // 额度。重新开通不重置账户内事件与付款标识，也不清除旧欠费。
@@ -677,6 +685,14 @@ func (s *Service) MonthlyUsage(accountID string, period Month) (Usage, error) {
 }
 
 // Status 返回账户状态：各月累计用量、各账单余额以及当前是否因欠费停用。
+//
+// Subscribed 只反映查询时刻是否已有实际生效的订阅：已登记但开通时刻尚未到达
+// （now 早于 activatedAt，按 UTC 瞬间比较）时 Subscribed 为 false、
+// CurrentTerms 为零值，也没有待换套餐安排与待取消终止时刻；历史各月用量与已
+// 生成账单仍照常展示。查询本身是只读判断，不会删除或提前激活已登记订阅。
+// Subscribed 与 Suspended 相互独立：等待开通不能清除旧欠费，显示未生效期间
+// 仍可能 Suspended 为 true；结清旧欠费只改变付款与停用结果，不使未来订阅提前
+// 生效。
 func (s *Service) Status(accountID string) (AccountStatus, error) {
 	if accountID == "" {
 		return AccountStatus{}, invalidf("account id is empty")
@@ -692,6 +708,10 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 	// 查询即让已到期安排/取消生效：月初零点或终止时刻之后无需上报用量或出账，
 	// 当前条件与订阅状态立即更新。
 	s.settleLocked(acc, now)
+	// 已登记但开通时刻尚未到达的订阅不算生效：查询时刻早于 activatedAt 时
+	// 与无有效订阅一致展示。判断以实际开通时刻为界（同一瞬间与时区无关），
+	// 不按开通月份提前生效；此处只读判断，不会提前激活或删除该登记。
+	active := acc.sub != nil && !now.Before(acc.sub.activatedAt)
 
 	periodSet := make(map[Month]struct{}, len(acc.usage)+len(acc.bills))
 	for m := range acc.usage {
@@ -708,12 +728,14 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 
 	st := AccountStatus{
 		AccountID:    accountID,
-		Subscribed:   acc.sub != nil,
+		Subscribed:   active,
 		Suspended:    s.isSuspendedLocked(acc, now),
 		MonthlyUsage: make([]Usage, 0, len(periods)),
 		Bills:        make([]BillSummary, 0, len(acc.bills)),
 	}
-	if acc.sub != nil {
+	// 仅在订阅确已生效时返回当前条件与待生效安排/终止时刻；等待开通期间
+	// CurrentTerms 为零值，也不展示任何待换套餐安排或待取消终止时刻。
+	if active {
 		st.CurrentTerms = acc.sub.terms
 		if acc.sub.pending != nil {
 			pending := *acc.sub.pending
