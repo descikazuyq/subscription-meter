@@ -44,6 +44,10 @@ type billRecord struct {
 type paymentRecord struct {
 	period Month
 	amount int64
+	// balance/settled 是本笔付款首次成功登记完成时账单余额与付清状态的快照。
+	// 完全相同的重报返回该快照，不随账单之后收到其他付款而变化。
+	balance int64
+	settled bool
 }
 
 type account struct {
@@ -582,8 +586,20 @@ func (s *Service) GetBill(accountID string, period Month) (Bill, error) {
 }
 
 // RecordPayment 为指定账单登记一笔大于零且不超过余额的本地付款，支持分次登记。
-// 付款标识在同一账户内去重：相同账单和金额的重报返回原结果，
-// 改成其他账单或金额返回 ErrPaymentConflict；失败不消耗付款标识。
+//
+// 付款标识在同一账户内去重：完全相同（账单账期与金额一致）的重报始终成功，
+// Registered 为 false，且不会再次增加已付金额；返回的付款内容、BillBalance 与
+// Settled 均为该笔付款首次成功登记完成时的结果快照，不随账单之后收到其他付款
+// 而变化——例如一笔只付了部分欠款的付款，在账单被后续付款结清后原样重报，仍
+// 返回当时的未清余额与尚未付清。该历史结果不影响 GetBill/Status 中账单的当前
+// 余额与停用状态，也不会因此重新停用已恢复的账户。
+//
+// 相同标识改了账期或金额返回 ErrPaymentConflict：即使原账单已经结清、或改指向
+// 的账期还没有账单，也按冲突处理而不是当作新付款。完全相同的重报不因原金额已
+// 超过当前余额而失败。
+//
+// 其他失败（账户或账单不存在、金额非法、超出当前余额、溢出）不改变账单、
+// 不占用付款标识。
 func (s *Service) RecordPayment(accountID, paymentID string, period Month, amount int64) (PaymentResult, error) {
 	if accountID == "" {
 		return PaymentResult{}, invalidf("account id is empty")
@@ -601,20 +617,17 @@ func (s *Service) RecordPayment(accountID, paymentID string, period Month, amoun
 	if !ok {
 		return PaymentResult{}, ErrAccountNotFound
 	}
-	// 去重先于账单查找：相同标识改指向其他账单（哪怕不存在）也是冲突。
+	// 去重先于账单查找：相同标识改了账期或金额（哪怕目标账单不存在）也是冲突；
+	// 完全相同则原样返回首次登记时的快照，不读取账单当前状态、不再次扣款。
 	if prev, ok := acc.payments[paymentID]; ok {
 		if prev.period != period || prev.amount != amount {
 			return PaymentResult{}, ErrPaymentConflict
 		}
-		rec, ok := acc.bills[period]
-		if !ok {
-			return PaymentResult{}, ErrBillNotFound
-		}
 		return PaymentResult{
 			Registered:  false,
-			Payment:     Payment{AccountID: accountID, PaymentID: paymentID, Period: period, Amount: amount},
-			BillBalance: rec.bill.Balance,
-			Settled:     rec.bill.Settled,
+			Payment:     Payment{AccountID: accountID, PaymentID: paymentID, Period: prev.period, Amount: prev.amount},
+			BillBalance: prev.balance,
+			Settled:     prev.settled,
 		}, nil
 	}
 
@@ -636,7 +649,13 @@ func (s *Service) RecordPayment(accountID, paymentID string, period Month, amoun
 	if rec.bill.Balance == 0 {
 		rec.bill.Settled = true
 	}
-	acc.payments[paymentID] = paymentRecord{period: period, amount: amount}
+	// 保存登记完成时的账单状态，供日后完全相同的重报原样返回。
+	acc.payments[paymentID] = paymentRecord{
+		period:  period,
+		amount:  amount,
+		balance: rec.bill.Balance,
+		settled: rec.bill.Settled,
+	}
 
 	return PaymentResult{
 		Registered:  true,
