@@ -147,9 +147,19 @@ func (s *Service) UpdatePlan(p Plan) error {
 // 每个账户只允许一份有效订阅；从 activatedAt 起接收用量，
 // 首月仍收完整月费并提供完整额度。
 //
+// activatedAt 可以晚于当前时刻，即提前登记一份尚未生效的订阅：登记会被保留，
+// 但在实际开通时刻到达前 Status 的 Subscribed 为 false、CurrentTerms 为零值，
+// 也没有待换套餐安排与待取消终止时刻；此期间再次开通仍返回
+// ErrSubscriptionExists，安排换套餐、登记取消返回 ErrSubscriptionNotActivated。
+// 判断以实际开通时刻为界（按同一瞬间比较，带时区的开通时间结果一致），不按
+// 开通月份提前生效；到达开通时刻后查询即显示有效订阅与登记时保存的完整套餐
+// 条件快照，等待期间修改套餐定义不改变该快照。
+//
 // 订阅终止（按月取消到达终止时刻）后可用本入口重新开通：activatedAt 不得早于
 // 上一段订阅的终止时刻；重新开通保存当时的套餐条件，当月仍收完整月费、给完整
-// 额度。重新开通不重置账户内事件与付款标识，也不清除旧欠费。
+// 额度。重新开通不重置账户内事件与付款标识，也不清除旧欠费。同样允许登记未来
+// 的重新开通时刻：旧订阅已结束、新订阅尚未开始的间隔中查询不显示任何生效套餐，
+// 历史用量与账单继续可查。
 func (s *Service) Subscribe(accountID, planID string, activatedAt time.Time) error {
 	if accountID == "" {
 		return invalidf("account id is empty")
@@ -204,9 +214,13 @@ func nextMonth(period Month) Month {
 // 并在到达取消终止时刻时把当前段标记终止、移入 acc.history。
 // 到达月初零点（或终止时刻）即生效，无需先上报用量或生成账单；即使中间若干月
 // 没有调用服务，再次进入时也会在此一次性补齐。调用时持有 s.mu。
+//
+// 开通时刻尚未到达的订阅段只是提前登记：它尚未生效，既没有已生效的套餐条件，
+// 也不可能有待换套餐安排或待取消终止时刻，因此在到达开通时刻前不做任何处理，
+// 尤其不能按开通月份让条件“提前生效”。
 func (s *Service) settleLocked(acc *account, now time.Time) {
 	sub := acc.sub
-	if sub == nil {
+	if sub == nil || now.Before(sub.activatedAt) {
 		return
 	}
 	current := MonthOf(now)
@@ -693,6 +707,12 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 	// 当前条件与订阅状态立即更新。
 	s.settleLocked(acc, now)
 
+	// 订阅是否生效以实际开通时刻为界：提前登记、开通时刻尚未到达的订阅仍
+	// 保存在 acc.sub 中（再次开通、安排换套餐、登记取消均按已有订阅的规则
+	// 处理），但查询时刻不显示为有效订阅。到达开通时刻即生效，不按开通月份
+	// 提前生效；时刻按同一瞬间比较，使用带时区的时间结果一致。
+	active := acc.sub != nil && !now.Before(acc.sub.activatedAt)
+
 	periodSet := make(map[Month]struct{}, len(acc.usage)+len(acc.bills))
 	for m := range acc.usage {
 		periodSet[m] = struct{}{}
@@ -708,12 +728,14 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 
 	st := AccountStatus{
 		AccountID:    accountID,
-		Subscribed:   acc.sub != nil,
+		Subscribed:   active,
 		Suspended:    s.isSuspendedLocked(acc, now),
 		MonthlyUsage: make([]Usage, 0, len(periods)),
 		Bills:        make([]BillSummary, 0, len(acc.bills)),
 	}
-	if acc.sub != nil {
+	// 仅实际生效的订阅才展示当前套餐条件、待换套餐安排与已安排终止时刻；
+	// 等待开通期间这些字段均为零值（查询不删除也不提前激活已登记订阅）。
+	if active {
 		st.CurrentTerms = acc.sub.terms
 		if acc.sub.pending != nil {
 			pending := *acc.sub.pending
