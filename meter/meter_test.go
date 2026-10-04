@@ -131,7 +131,7 @@ func TestSubscribeMissingRefsAndSnapshot(t *testing.T) {
 func (s *Service) subTerms(id string) PlanTerms {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.accounts[id].sub.terms
+	return termsForPeriod(s.accounts[id].sub, MonthOf(s.nowUTC()))
 }
 
 func TestEventDedupConflictAndTimeRules(t *testing.T) {
