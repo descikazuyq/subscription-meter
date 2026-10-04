@@ -16,12 +16,13 @@ type Service struct {
 }
 
 type subRecord struct {
-	planID      string
-	terms       PlanTerms
 	activatedAt time.Time
-	// termsHistory 按生效月份升序记录每次换套餐后的条件；
-	// 首条为开通当月适用的开通快照。账单按账期从中取当时适用的条件。
-	termsHistory []termsEntry
+	// terms 是本订阅段唯一的套餐条件来源，按生效账期升序保存：
+	// 首条为开通当月适用的开通快照，之后每条是一次已生效换套餐安排锁定的
+	// 快照。当前套餐标识、当前完整条件与历史出账都从这里按“不晚于指定账期
+	// 的最后一条”同一条规则取用（见 termsForPeriod），换套餐生效时只追加
+	// 一条，不再另外维护当前套餐标识与当前条件的副本。
+	terms []termsEntry
 	// pending 尚未生效的换套餐安排，每账户至多一条；nil 表示无安排。
 	pending *PlanChange
 	// cancelEnd 已安排的终止时刻（取消请求时刻的下一个 UTC 自然月月初）。
@@ -194,10 +195,8 @@ func (s *Service) Subscribe(accountID, planID string, activatedAt time.Time) err
 		}
 	}
 	acc.sub = &subRecord{
-		planID:      planID,
-		terms:       termsOf(plan),
 		activatedAt: activated,
-		termsHistory: []termsEntry{{
+		terms: []termsEntry{{
 			effective: MonthOf(activated),
 			terms:     termsOf(plan),
 		}},
@@ -225,13 +224,12 @@ func (s *Service) settleLocked(acc *account, now time.Time) {
 	}
 	current := MonthOf(now)
 	for sub.pending != nil && !current.Before(sub.pending.EffectivePeriod) {
-		entry := termsEntry{
+		// 生效只做一件事：把安排锁定的条件追加进时间线。
+		// 当前套餐标识与当前条件由该时间线统一推导，无需同步副本。
+		sub.terms = append(sub.terms, termsEntry{
 			effective: sub.pending.EffectivePeriod,
 			terms:     sub.pending.Terms,
-		}
-		sub.termsHistory = append(sub.termsHistory, entry)
-		sub.planID = sub.pending.TargetPlanID
-		sub.terms = sub.pending.Terms
+		})
 		sub.pending = nil
 	}
 	if sub.cancelEnd != nil && !now.Before(*sub.cancelEnd) {
@@ -262,11 +260,12 @@ func activeSegmentAtLocked(acc *account, at time.Time) *subRecord {
 }
 
 // termsForPeriod 在订阅段 sub 中返回指定账期当时适用的套餐条件快照。
-// 条件历史按生效月份升序，取不晚于 period 的最后一条；
-// 这样历史账单始终按该账期条件计算，不受后续换套餐影响。
+// 这是“同一账期采用哪份条件”的唯一判定：条件时间线按生效月份升序，取不晚于
+// period 的最后一条。当前状态查询、能否换套餐的判断与历史出账都经此取用，
+// 因而当前条件与历史账单条件永远一致，后续修改本功能只需维护这一处规则。
 func termsForPeriod(sub *subRecord, period Month) PlanTerms {
-	t := sub.termsHistory[0].terms
-	for _, e := range sub.termsHistory {
+	t := sub.terms[0].terms
+	for _, e := range sub.terms {
 		if period.Before(e.effective) {
 			break
 		}
@@ -339,7 +338,7 @@ func (s *Service) SchedulePlanChange(accountID, targetPlanID string) (PlanChange
 	if !ok {
 		return PlanChangeResult{}, ErrPlanNotFound
 	}
-	if targetPlanID == acc.sub.planID {
+	if targetPlanID == termsForPeriod(acc.sub, MonthOf(now)).PlanID {
 		return PlanChangeResult{}, ErrPlanChangeSamePlan
 	}
 
@@ -736,7 +735,8 @@ func (s *Service) Status(accountID string) (AccountStatus, error) {
 	// 仅实际生效的订阅才展示当前套餐条件、待换套餐安排与已安排终止时刻；
 	// 等待开通期间这些字段均为零值（查询不删除也不提前激活已登记订阅）。
 	if active {
-		st.CurrentTerms = acc.sub.terms
+		// 当前条件与历史出账走同一取用入口：当前账期适用的最后一条快照。
+		st.CurrentTerms = termsForPeriod(acc.sub, MonthOf(now))
 		if acc.sub.pending != nil {
 			pending := *acc.sub.pending
 			st.PendingChange = &pending
