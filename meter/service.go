@@ -242,18 +242,64 @@ func (s *Service) settleLocked(acc *account, now time.Time) {
 	}
 }
 
-// activeSegmentAtLocked 返回覆盖时刻 at 的订阅段：activatedAt <= at < end。
-// 优先检查当前段，再按时间倒序检查历史段。调用时持有 s.mu。
-func activeSegmentAtLocked(acc *account, at time.Time) *subRecord {
-	if cur := acc.sub; cur != nil && !at.Before(cur.activatedAt) {
-		if cur.cancelEnd == nil || at.Before(*cur.cancelEnd) {
-			return cur
+// coverage 是一段订阅的覆盖范围，用统一的半开区间 [start, end) 表达：
+// start 为开通时刻（含）；end 为终止时刻（不含），nil 表示该段尚未终止、
+// 其后所有时刻都在覆盖内。seg 指向该区间所属的订阅段（内含该段锁定的套餐
+// 条件时间线）。
+type coverage struct {
+	start time.Time
+	end   *time.Time
+	seg   *subRecord
+}
+
+// subCoverages 枚举账户各历史段与当前段的统一覆盖区间，按时间升序（旧 → 新）。
+// 用量接收与月度出账对“订阅期间与空档”的判断都只经过这里，因此两个操作对同一
+// 账户的分段、开通时刻与终止时刻依据完全一致，不再各自遍历订阅段。
+//
+// 未来登记的当前段以其真实开通时刻作为 start：开通之前 start <= at 不成立，
+// 不会仅因账户里存有该段就让开通前的事件获得资格，也不会覆盖开通前的月份。
+func subCoverages(acc *account) []coverage {
+	cov := make([]coverage, 0, len(acc.history)+1)
+	for _, h := range acc.history {
+		cov = append(cov, coverage{start: h.activatedAt, end: h.endedAt, seg: h})
+	}
+	if cur := acc.sub; cur != nil {
+		cov = append(cov, coverage{start: cur.activatedAt, end: cur.cancelEnd, seg: cur})
+	}
+	return cov
+}
+
+// beforeEnd 报告 at 是否严格早于覆盖区间右端；右端为 nil（尚未终止）时恒真。
+func beforeEnd(at time.Time, end *time.Time) bool {
+	return end == nil || at.Before(*end)
+}
+
+// coversInstant 是用量归属的统一谓词：事件发生瞬间必须落在某段订阅期间内，
+// 开通时刻计入、终止时刻不计入（[start, end)），只看实际瞬间而不看发生月份。
+// 时刻按同一瞬间比较，使用不同时区表达结果相同。返回覆盖该瞬间的订阅段。
+func coversInstant(covs []coverage, at time.Time) *subRecord {
+	for _, c := range covs {
+		if !at.Before(c.start) && beforeEnd(at, c.end) {
+			return c.seg
 		}
 	}
-	for i := len(acc.history) - 1; i >= 0; i-- {
-		h := acc.history[i]
-		if !at.Before(h.activatedAt) && at.Before(*h.endedAt) {
-			return h
+	return nil
+}
+
+// coversMonth 是月度出账的统一谓词：账期是否“整月确实被某段订阅覆盖”，是则
+// 返回该订阅段（出账按该段、该月当时锁定的套餐条件计价）。
+// 它不能套用月初那一刻是否已开通：开通月计入（月中开通的当月在月末结束后仍
+// 按完整月费与额度出账），故左界取月份不早于开通月；终止月不计入旧订阅
+// （终止时刻所在月没有被该段整月覆盖），故右界要求整月结束不晚于终止时刻。
+// 完全无订阅的空档月份、终止所在月返回 nil；尚未终止的段其后所有月份都覆盖。
+//
+// 与时刻谓词共用同一份 [start, end) 区间：重新开通不会把两段之间的空档变成
+// 有效期间；若终止后同月重新开通，该月不满足旧段、满足新段，按新订阅条件出账。
+// 重新开通时刻不得早于上段终止时刻，因此同一月份至多被一段整月覆盖，归属唯一。
+func coversMonth(covs []coverage, period Month) *subRecord {
+	for _, c := range covs {
+		if !period.Before(MonthOf(c.start)) && (c.end == nil || !period.End().After(*c.end)) {
+			return c.seg
 		}
 	}
 	return nil
@@ -273,25 +319,6 @@ func termsForPeriod(sub *subRecord, period Month) PlanTerms {
 		t = e.terms
 	}
 	return t
-}
-
-// segmentForBillingLocked 返回账期 period 应使用的订阅段：
-// 该订阅段在该账期内确有覆盖（开通当月计入，终止当月不计入）。
-// 完全无订阅覆盖的月份返回 nil。调用时持有 s.mu。
-func segmentForBillingLocked(acc *account, period Month) *subRecord {
-	if cur := acc.sub; cur != nil && !period.Before(MonthOf(cur.activatedAt)) {
-		return cur
-	}
-	for i := len(acc.history) - 1; i >= 0; i-- {
-		h := acc.history[i]
-		if period.Before(MonthOf(h.activatedAt)) {
-			continue
-		}
-		if period.Before(MonthOf(*h.endedAt)) {
-			return h
-		}
-	}
-	return nil
 }
 
 // SchedulePlanChange 安排账户从下一个 UTC 自然月起改用另一套餐，升级与降级规则相同。
@@ -510,7 +537,8 @@ func (s *Service) RecordEvent(e Event) (EventResult, error) {
 		return EventResult{}, ErrEventInFuture
 	}
 	// 事件发生时刻必须落在某段实际订阅期间：[activatedAt, end)。
-	if activeSegmentAtLocked(acc, at) == nil {
+	// 与月度出账使用同一份订阅段覆盖枚举与半开区间谓词。
+	if coversInstant(subCoverages(acc), at) == nil {
 		return EventResult{}, ErrEventBeforeSubscription
 	}
 
@@ -556,8 +584,8 @@ func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 	}
 
 	now := s.nowUTC()
-	// 补齐到期换套餐/取消（条件历史与分段），随后按账期取覆盖该月的订阅段中
-	// 当时适用的条件：即使已重新开通或先出新月份账单再补旧月份账单，历史账单
+	// 补齐到期换套餐/取消（条件历史与分段），随后按账期取整月覆盖该月的订阅段
+	// 中当时适用的条件：即使已重新开通或先出新月份账单再补旧月份账单，历史账单
 	// 也不会被后来的订阅覆盖。
 	s.settleLocked(acc, now)
 
@@ -568,9 +596,11 @@ func (s *Service) CreateBill(accountID string, period Month) (Bill, error) {
 		return Bill{}, ErrBillMonthNotEnded
 	}
 
-	sub := segmentForBillingLocked(acc, period)
+	// 与用量接收使用同一份订阅段覆盖枚举；出账要求整月确实被某段覆盖，
+	// 而不是月初那一刻已开通（开通月计入、终止月与空档月不计入）。
+	sub := coversMonth(subCoverages(acc), period)
 	if sub == nil {
-		// 早于首段开通，或处于两段订阅之间的空档。
+		// 早于首段开通、终止所在月，或处于两段订阅之间的空档。
 		return Bill{}, ErrBillBeforeSubscription
 	}
 
