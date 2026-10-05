@@ -2,7 +2,9 @@ package meter
 
 import "time"
 
-// Plan 是套餐的当前定义。修改套餐只影响之后开通的订阅。
+// Plan 是套餐的当前定义。修改套餐只影响此后新取得条件的场合：之后开通订阅、
+// 或为已开通账户安排换套餐被接受时取得新条件；账户正在使用的条件与此前已
+// 接受的换套餐安排都保存为快照，不随定义修改而改变。
 type Plan struct {
 	// ID 套餐唯一标识，不可为空。
 	ID string
@@ -16,8 +18,8 @@ type Plan struct {
 	TaxRateBasisPoints int64
 }
 
-// PlanTerms 是开通订阅时保存的套餐条件快照。
-// 之后修改套餐不影响使用该快照的订阅计费。
+// PlanTerms 是一份套餐条件快照：开通订阅或安排换套餐被接受时保存。
+// 之后修改套餐定义不影响使用这份快照的订阅与安排计费。
 type PlanTerms struct {
 	PlanID             string
 	MonthlyFee         int64

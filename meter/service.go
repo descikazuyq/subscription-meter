@@ -128,8 +128,9 @@ func (s *Service) CreatePlan(p Plan) error {
 	return nil
 }
 
-// UpdatePlan 更新套餐当前条件。只影响之后开通的订阅，
-// 已开通订阅继续使用开通时保存的快照。
+// UpdatePlan 更新套餐当前条件。修改只对之后新取得条件的场合生效：之后开通
+// 订阅、或为已开通账户安排换套餐被接受时按新定义取条件；已开通订阅正在使用
+// 的条件快照与此前已接受的换套餐安排都不会被改写。
 func (s *Service) UpdatePlan(p Plan) error {
 	if err := validatePlan(p); err != nil {
 		return err

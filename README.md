@@ -32,6 +32,281 @@ go test ./...
 出账），历史用量与账单继续可查；终止后可通过 `Subscribe` 重新开通（开通时刻不得
 早于上次终止时刻），支持多次取消与重新开通，旧月份归属与计价不被后来订阅覆盖。
 
+## 修改套餐定义与安排换套餐
+
+`UpdatePlan` 与 `SchedulePlanChange` 是两件不同的事，调用方需要分清：
+
+- **`UpdatePlan` 修改的是套餐的“当前定义”**。修改只对**之后新取得条件**的
+  场合生效：之后开通订阅、或为已开通账户安排换套餐被接受时，按修改后的定义
+  取得条件。它**不会**改写账户正在使用的条件（那是开通时保存的快照），也
+  **不会**改写此前已接受的换套餐安排（安排接受时已锁定自己的快照）。因此
+  “修改套餐只影响之后开通的订阅”这一说法过窄：已开通账户后来安排换用这个
+  套餐时，取得的是**安排被接受时**的定义；安排一旦接受，定义再怎么改都与
+  它无关。
+- **`SchedulePlanChange` 是“给某个账户安排换套餐”**。安排被接受即锁定目标
+  套餐的完整条件（月费、包含额度、超额单价、税率）与生效账期（接受时的下一
+  个 UTC 自然月），到该账期月初零点自动生效，无需上报用量或出账。每账户至
+  多一条待生效安排。
+
+重复安排同一目标套餐的结果要分两种情况：**安排尚未生效时**，再次安排同一
+目标成功返回原安排，`Created` 为 `false`，不会重新取价——即使这期间用
+`UpdatePlan` 改过定义，返回的仍是首次接受时锁定的条件；**安排生效后**，目标
+套餐已是当前套餐，再安排它按现有规则返回 `ErrPlanChangeSamePlan`。
+
+下面的示例只用公开入口即可运行，围绕账户 `acct-switch` 从套餐 A 换到 B
+展开，金额单位为分，所有时刻与账期均为 UTC。账户 2026-01-01 00:00 UTC
+起使用 A（月费 1000、包含 100、超额单价 10、税率 1000‱）；1 月 15 日
+安排 2 月换到 B，安排时 B 的定义为月费 2000、包含 200、超额单价 8、税率
+600‱。随后把 B 的定义改成月费 5000、包含 50、超额单价 20、税率 1000‱，
+再次安排 B 返回原安排、`Created=false`；2 月月初零点后直接查询即显示锁定
+的 B 条件、待生效安排消失，再安排 B 得到同套餐错误。一月用量 150 按 A
+出账（完整月费与额度，超额 50×10=500、税 150、应付 1650）；账单到期未付
+导致欠费停用，二月用量先被拒收，登记 1650 分付款后恢复并重新提交；三月
+一日为二月出账，用的是锁定的 B 条件（超额 100×8=800、税 168、应付
+2968），修改后的 B 定义没有混入；二月出账后一月账单金额不变。该示例以
+Example 测试形式保存在 `meter/plan_change_example_test.go`，
+`go test ./...` 会校验其输出：
+
+```go
+const (
+    accountID = "acct-switch"
+    jan1st    = "2026-01-01T00:00:00Z"
+)
+jan := meter.MonthOf(mustParseTime(jan1st))
+feb := meter.MonthOf(mustParseTime("2026-02-05T00:00:00Z"))
+
+// 当前时刻从 2026-01-15 12:00 UTC 起步，随后只通过给 now 赋新值推进，
+// 示例输出与运行当天日期无关。
+now := mustParseTime("2026-01-15T12:00:00Z")
+s := meter.NewServiceWithClock(func() time.Time { return now })
+
+if err := s.CreateAccount(accountID); err != nil {
+    panic(err)
+}
+// 套餐 A：账户一月正在使用的条件。月费 1000、包含 100、超额单价 10、税率 1000‱。
+if err := s.CreatePlan(meter.Plan{
+    ID:                 "plan-a",
+    MonthlyFee:         1000,
+    IncludedUnits:      100,
+    OveragePrice:       10,
+    TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+// 套餐 B：安排换套餐被接受时的定义。月费 2000、包含 200、超额单价 8、税率 600‱。
+if err := s.CreatePlan(meter.Plan{
+    ID:                 "plan-b",
+    MonthlyFee:         2000,
+    IncludedUnits:      200,
+    OveragePrice:       8,
+    TaxRateBasisPoints: 600,
+}); err != nil {
+    panic(err)
+}
+// 账户自 2026-01-01 00:00 UTC 起订阅套餐 A，开通时保存 A 的条件快照。
+if err := s.Subscribe(accountID, "plan-a", mustParseTime(jan1st)); err != nil {
+    panic(err)
+}
+
+// 一月中旬安排二月换到 B：安排被接受即锁定 B 的完整条件与生效账期 2026-02。
+change, err := s.SchedulePlanChange(accountID, "plan-b")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("change 1    created=%t target=%s monthlyFee=%d included=%d overagePrice=%d taxBasisPoints=%d effective=%s\n",
+    change.Created, change.Change.TargetPlanID, change.Change.Terms.MonthlyFee,
+    change.Change.Terms.IncludedUnits, change.Change.Terms.OveragePrice,
+    change.Change.Terms.TaxRateBasisPoints, change.Change.EffectivePeriod)
+
+// 此时查询仍显示 A；待生效安排为 B，安排里保存的就是接受时锁定的完整条件。
+st, err := s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("status jan  current=%s monthlyFee=%d pendingTarget=%s pendingFee=%d pendingIncluded=%d pendingOverage=%d pendingTaxBp=%d pendingEffective=%s\n",
+    st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.PendingChange.TargetPlanID, st.PendingChange.Terms.MonthlyFee,
+    st.PendingChange.Terms.IncludedUnits, st.PendingChange.Terms.OveragePrice,
+    st.PendingChange.Terms.TaxRateBasisPoints, st.PendingChange.EffectivePeriod)
+
+// 修改套餐 B 的“定义”：月费、包含额度、超额单价、税率全部改变。
+// 这不会改写账户正在使用的 A 条件，也不会改写上面已接受的待生效安排。
+if err := s.UpdatePlan(meter.Plan{
+    ID:                 "plan-b",
+    MonthlyFee:         5000,
+    IncludedUnits:      50,
+    OveragePrice:       20,
+    TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+fmt.Printf("plan B      monthlyFee=5000 included=50 overagePrice=20 taxBasisPoints=1000\n")
+
+// 安排尚未生效时再次安排同一目标 B：成功返回原安排，Created=false，
+// 条件仍是首次接受时的 2000/200/8/600‱，不会按修改后的定义重新取价。
+again, err := s.SchedulePlanChange(accountID, "plan-b")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("change 2    created=%t target=%s monthlyFee=%d included=%d overagePrice=%d taxBasisPoints=%d effective=%s\n",
+    again.Created, again.Change.TargetPlanID, again.Change.Terms.MonthlyFee,
+    again.Change.Terms.IncludedUnits, again.Change.Terms.OveragePrice,
+    again.Change.Terms.TaxRateBasisPoints, again.Change.EffectivePeriod)
+
+// 查询结果同样不变：当前仍是 A，待生效安排仍锁定修改前的 B 条件。
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("status jan  current=%s monthlyFee=%d pendingTarget=%s pendingFee=%d pendingIncluded=%d pendingOverage=%d pendingTaxBp=%d pendingEffective=%s\n",
+    st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.PendingChange.TargetPlanID, st.PendingChange.Terms.MonthlyFee,
+    st.PendingChange.Terms.IncludedUnits, st.PendingChange.Terms.OveragePrice,
+    st.PendingChange.Terms.TaxRateBasisPoints, st.PendingChange.EffectivePeriod)
+
+// 一月一笔 150 单位的用量（超过 A 的 100 单位额度）。
+now = mustParseTime("2026-01-20T10:00:00Z")
+ev, err := s.RecordEvent(meter.Event{
+    AccountID: accountID,
+    EventID:   "e-jan",
+    At:        mustParseTime("2026-01-20T10:00:00Z"),
+    Quantity:  150,
+})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("event jan   accepted=%t period=%s\n", ev.Accepted, ev.Period)
+usage, err := s.MonthlyUsage(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("usage       period=%s total=%d\n", usage.Period, usage.Total)
+
+// 推进到 2026-02-01 00:00 UTC：无需上报用量或生成账单，直接查询即显示
+// 安排锁定的 B 条件（修改后的 B 定义没有混入），待生效安排消失。
+now = mustParseTime("2026-02-01T00:00:00Z")
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("status feb  subscribed=%t suspended=%t current=%s monthlyFee=%d included=%d overagePrice=%d taxBasisPoints=%d pending=%t\n",
+    st.Subscribed, st.Suspended, st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.CurrentTerms.IncludedUnits, st.CurrentTerms.OveragePrice,
+    st.CurrentTerms.TaxRateBasisPoints, st.PendingChange != nil)
+
+// 安排已经生效，B 就是当前套餐：再安排 B 按现有规则返回同套餐错误，
+// 而不是“返回原安排、Created=false”——后者只适用于安排尚未生效时。
+_, err = s.SchedulePlanChange(accountID, "plan-b")
+fmt.Printf("schedule b  errPlanChangeSamePlan=%t\n", errors.Is(err, meter.ErrPlanChangeSamePlan))
+
+// 账期结束后为一月出账：仍收 A 的完整月费并给完整额度。
+// 超额 50 单位×10=500；税 (1000+500)×1000‱=150；应付 1650。
+janBill, err := s.CreateBill(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill jan    plan=%s monthlyFee=%d usage=%d included=%d overageUnits=%d overagePrice=%d overageFee=%d taxBp=%d tax=%d totalDue=%d paid=%d balance=%d settled=%t dueAt=%s\n",
+    janBill.Terms.PlanID, janBill.MonthlyFee, janBill.TotalUsage, janBill.IncludedUnits,
+    janBill.OverageUnits, janBill.Terms.OveragePrice, janBill.OverageFee,
+    janBill.Terms.TaxRateBasisPoints, janBill.Tax, janBill.TotalDue, janBill.Paid,
+    janBill.Balance, janBill.Settled, janBill.DueAt.Format(time.RFC3339))
+
+// 推进到 2026-02-09 00:00 UTC：一月账单截止时刻 2026-02-08 已过且未付，
+// 账户因欠费停用（订阅仍有效、当前条件不变）。
+now = mustParseTime("2026-02-09T00:00:00Z")
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("status due  suspended=%t\n", st.Suspended)
+
+// 二月一笔 300 单位的用量：停用期间被拒绝（ErrSuspended），不消耗事件标识。
+_, err = s.RecordEvent(meter.Event{
+    AccountID: accountID,
+    EventID:   "e-feb",
+    At:        mustParseTime("2026-02-05T00:00:00Z"),
+    Quantity:  300,
+})
+fmt.Printf("event feb   errSuspended=%t\n", errors.Is(err, meter.ErrSuspended))
+
+// 正常登记一笔 1650 分的付款结清一月账单，解除欠费停用；
+// 付款只减少余额，不改变一月账单的应付金额。
+pay, err := s.RecordPayment(accountID, "pay-jan", jan, janBill.TotalDue)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("payment     registered=%t paymentID=%s period=%s amount=%d billBalance=%d settled=%t\n",
+    pay.Registered, pay.Payment.PaymentID, pay.Payment.Period, pay.Payment.Amount,
+    pay.BillBalance, pay.Settled)
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("status paid suspended=%t\n", st.Suspended)
+
+// 解除停用后再次提交同一事件：作为首次接收，归入 2026-02。
+ev, err = s.RecordEvent(meter.Event{
+    AccountID: accountID,
+    EventID:   "e-feb",
+    At:        mustParseTime("2026-02-05T00:00:00Z"),
+    Quantity:  300,
+})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("event feb   accepted=%t period=%s\n", ev.Accepted, ev.Period)
+usage, err = s.MonthlyUsage(accountID, feb)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("usage       period=%s total=%d\n", usage.Period, usage.Total)
+
+// 推进到 2026-03-01 00:00 UTC，二月账期结束后才为它出账。
+// 使用的是安排锁定的 B 条件（2000/200/8/600‱），不是修改后的定义
+// （5000/50/20/1000‱）：超额 100 单位×8=800；税 2800×600‱=168；应付 2968。
+now = mustParseTime("2026-03-01T00:00:00Z")
+febBill, err := s.CreateBill(accountID, feb)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill feb    plan=%s monthlyFee=%d usage=%d included=%d overageUnits=%d overagePrice=%d overageFee=%d taxBp=%d tax=%d totalDue=%d paid=%d balance=%d settled=%t dueAt=%s\n",
+    febBill.Terms.PlanID, febBill.MonthlyFee, febBill.TotalUsage, febBill.IncludedUnits,
+    febBill.OverageUnits, febBill.Terms.OveragePrice, febBill.OverageFee,
+    febBill.Terms.TaxRateBasisPoints, febBill.Tax, febBill.TotalDue, febBill.Paid,
+    febBill.Balance, febBill.Settled, febBill.DueAt.Format(time.RFC3339))
+
+// 二月出账后再查一月账单：金额仍是出账时的 1650，且已付清。
+gotJan, err := s.GetBill(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("get jan bill totalDue=%d paid=%d balance=%d settled=%t\n",
+    gotJan.TotalDue, gotJan.Paid, gotJan.Balance, gotJan.Settled)
+```
+
+输出（`mustParseTime` 用 `time.Parse(time.RFC3339, value)` 解析上述常量即可）：
+
+```text
+change 1    created=true target=plan-b monthlyFee=2000 included=200 overagePrice=8 taxBasisPoints=600 effective=2026-02
+status jan  current=plan-a monthlyFee=1000 pendingTarget=plan-b pendingFee=2000 pendingIncluded=200 pendingOverage=8 pendingTaxBp=600 pendingEffective=2026-02
+plan B      monthlyFee=5000 included=50 overagePrice=20 taxBasisPoints=1000
+change 2    created=false target=plan-b monthlyFee=2000 included=200 overagePrice=8 taxBasisPoints=600 effective=2026-02
+status jan  current=plan-a monthlyFee=1000 pendingTarget=plan-b pendingFee=2000 pendingIncluded=200 pendingOverage=8 pendingTaxBp=600 pendingEffective=2026-02
+event jan   accepted=true period=2026-01
+usage       period=2026-01 total=150
+status feb  subscribed=true suspended=false current=plan-b monthlyFee=2000 included=200 overagePrice=8 taxBasisPoints=600 pending=false
+schedule b  errPlanChangeSamePlan=true
+bill jan    plan=plan-a monthlyFee=1000 usage=150 included=100 overageUnits=50 overagePrice=10 overageFee=500 taxBp=1000 tax=150 totalDue=1650 paid=0 balance=1650 settled=false dueAt=2026-02-08T00:00:00Z
+status due  suspended=true
+event feb   errSuspended=true
+payment     registered=true paymentID=pay-jan period=2026-01 amount=1650 billBalance=0 settled=true
+status paid suspended=false
+event feb   accepted=true period=2026-02
+usage       period=2026-02 total=300
+bill feb    plan=plan-b monthlyFee=2000 usage=300 included=200 overageUnits=100 overagePrice=8 overageFee=800 taxBp=600 tax=168 totalDue=2968 paid=0 balance=2968 settled=false dueAt=2026-03-08T00:00:00Z
+get jan bill totalDue=1650 paid=1650 balance=0 settled=true
+```
+
 ## 付款登记
 
 `RecordPayment` 为指定账期的账单分次登记付款，金额单位为分，须大于零且不超过
