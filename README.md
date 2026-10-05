@@ -31,3 +31,108 @@ go test ./...
 安排，撤回取消不恢复被清除的安排。终止时刻到达即无有效订阅（无需上报用量或
 出账），历史用量与账单继续可查；终止后可通过 `Subscribe` 重新开通（开通时刻不得
 早于上次终止时刻），支持多次取消与重新开通，旧月份归属与计价不被后来订阅覆盖。
+
+## 付款登记：重报返回的是历史结果，不是当前余额
+
+`RecordPayment` 支持分次付款，付款标识只在**所属账户内**去重。需要特别注意：
+**原样重报一笔旧付款时，返回的 `BillBalance` / `Settled` 是该笔付款首次成功
+登记完成时的历史结果，不会在本次调用时重新计算**，因此不能把它当成账单当前
+余额。在后续又付过款之后，旧付款重报里的余额可能比账单查询得到的当前余额更大
+（例如账单已结清，重报早先的部分付款仍返回当时的未清余额）。`Registered=false`
+只表示命中了此前已登记的同一笔付款（请求仍然成功，且不会再次扣款），并不表示
+付款失败。要展示最新欠款，应读取 `GetBill` 或 `Status`——其中的余额始终反映
+当前状态。
+
+下面的完整示例只使用公开入口：用 `NewServiceWithClock` 注入固定时钟，把当前
+时刻固定在 2026-02-01 00:00 UTC，于是账期 2026-01（UTC 自然月）已经结束，
+任何一天运行都能得到相同结果，无需等待真实日期。金额单位均为分。
+
+```go
+const accountID = "acct-demo"
+period := meter.Month{Year: 2026, Month: time.January} // 已结束的 UTC 自然月账期
+
+now := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+s := meter.NewServiceWithClock(func() time.Time { return now })
+
+if err := s.CreateAccount(accountID); err != nil {
+    panic(err)
+}
+// 月费 1000 分、额度与超额单价为 0、税率为 0：无用量时应付恰好 1000 分。
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-1000", MonthlyFee: 1000, IncludedUnits: 0,
+    OveragePrice: 0, TaxRateBasisPoints: 0,
+}); err != nil {
+    panic(err)
+}
+if err := s.Subscribe(accountID, "plan-1000",
+    time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)); err != nil {
+    panic(err)
+}
+bill, err := s.CreateBill(accountID, period) // 应付 1000 分
+if err != nil {
+    panic(err)
+}
+
+// p1 先登记 400 分：本次实际登记，登记后账单余额 600、未付清。
+first, err := s.RecordPayment(accountID, "p1", period, 400)
+if err != nil {
+    panic(err)
+}
+// first.Registered == true, first.BillBalance == 600, first.Settled == false
+
+// p2 登记剩余 600 分：账单结清，当前余额 0。
+if _, err := s.RecordPayment(accountID, "p2", period, 600); err != nil {
+    panic(err)
+}
+
+// 结清后原样重报 p1（账户、标识、账期、金额完全一致）：成功，但不再登记。
+replay, err := s.RecordPayment(accountID, "p1", period, 400)
+if err != nil {
+    panic(err)
+}
+// replay.Registered == false（不是失败，而是命中此前已登记的付款）
+// replay.Payment 仍是 p1 对 2026-01 登记的 400 分
+// replay.BillBalance == 600、replay.Settled == false —— 这是 p1 首次登记
+// 完成那一刻的历史结果，不是此刻重新计算的欠款（此刻当前余额其实是 0）。
+
+// 当前账单状态要读 GetBill / Status：累计已付 1000、余额 0、已付清。
+cur, err := s.GetBill(accountID, period)
+if err != nil {
+    panic(err)
+}
+// cur.Paid == 1000, cur.Balance == 0, cur.Settled == true
+// 旧付款重报不会再次增加已付金额，也不会使账单重新变成未付清。
+_ = bill
+_ = first
+_ = replay
+_ = cur
+```
+
+对照输出可直接区分两个时点（可运行版本见
+`meter/example_payment_replay_test.go`，`go test ./...` 会校验其输出）：
+
+```text
+p1 首次登记 400: registered=true billBalance=600 settled=false      # 付款确认：登记完成时
+p2 登记 600: registered=true billBalance=0 settled=true
+原样重报 p1: registered=false payment={id:p1 period:2026-01 amount:400} billBalance=600 settled=false  # 历史时点
+GetBill 当前状态: totalDue=1000 paid=1000 balance=0 settled=true    # 账单查询：当前时点
+Status 当前状态: paid=1000 balance=0 settled=true
+```
+
+原样重报要求**同一账户内**付款标识、账期、金额三者一致；任一不同都返回
+`ErrPaymentConflict`，原账单与原付款记录保持不变：
+
+```go
+// 沿用 p1 却把金额改成 401：冲突。
+_, err = s.RecordPayment(accountID, "p1", period, 401)
+// errors.Is(err, meter.ErrPaymentConflict) == true
+
+// 把 p1 改指向尚未出账的另一账期（哪怕那里还没有账单）：仍是冲突，
+// 不会被当作新付款，也不会返回 ErrBillNotFound。
+_, err = s.RecordPayment(accountID, "p1",
+    meter.Month{Year: 2026, Month: time.March}, 400)
+// errors.Is(err, meter.ErrPaymentConflict) == true
+```
+
+付款标识只在所属账户内去重：另一个账户复用 `p1` 会作为它自己的首次付款独立
+登记（`Registered=true`），两个账户的账单互不影响。
