@@ -469,6 +469,230 @@ get bill jan plan=plan-a totalUsage=15 totalDue=1650 balance=1650 settled=false
 cancel future errSubscriptionNotActivated=true
 ```
 
+## 单张账单的金额计算
+
+`CreateBill` 为单个已经结束的 UTC 自然月账期出一张账单，调用者可用账单
+上的明细自行核对税额与应付金额。计价只看该账期的**整月累计用量**与当时
+适用的套餐条件，与事件分几次上报无关，也不对每条用量事件单独算钱算税：
+
+- **金额单位为分**，所有金额都是非负 `int64`；用量按**整个 UTC 自然月**
+  累计，账单 `TotalUsage` 是该账期内全部已接收事件数量之和，出账后固定。
+- **包含额度按整月给、月费按整月收。** 超额单位为
+  `max(0, TotalUsage - IncludedUnits)`：整月总用量没有超过包含额度时，
+  超额费为零；超过时只对**超出的单位**按套餐约定的超额单价计费
+  （`OverageFee = OverageUnits × OveragePrice`）。无论用多用少，哪怕用量
+  为零，月费都完整计入，额度用不完也不抵扣月费、不退费。
+- **用账单所属月份适用的套餐条件计税。** 条件来自订阅开通时保存的快照、
+  或某次已生效换套餐安排锁定的快照；出账之后再用 `UpdatePlan` 修改套餐
+  定义，不会改变这张账单（包括税率）。
+- **税率是万分比**，`TaxRateBasisPoints=1000` 表示 10%（取值 0–10000）。
+- **月费与超额费先相加，再对合计金额计算一次税额**：
+  `Tax = 四舍五入到整分((MonthlyFee + OverageFee) × TaxRateBasisPoints / 10000)`，
+  不足半分舍去、**恰好半分向上进一分**；`TotalDue = MonthlyFee + OverageFee + Tax`。
+  不分别给月费、超额费各算一次税再各自舍入，也不对每条用量事件单独计税。
+
+下面的示例只用公开入口即可运行：通过 `NewServiceWithClock` 把当前时刻
+固定在 2026-02-01 00:00 UTC，使 2026-01 成为已经结束的账期，复制后不
+依赖运行当天的日期。主账户 `acct-bill` 的套餐为月费 3 分、包含 2 单位、
+超额单价 3 分、税率 1000（10%），订阅与事件时刻都写死在一月，当月累计
+用量 3 单位：超额 1 单位、超额费 3 分、税前合计 6 分、税额 1 分、应付
+7 分。账期结束后还修改了一次套餐定义，账单仍按一月适用的开通快照计价。
+`acct-bill-within` 使用同套餐但只用 2 单位（恰好用完额度），用来对照
+“没有超额时超额费为零、月费仍完整计入”；`acct-round-down` 与
+`acct-round-half` 分别是月费 4 分、5 分且税率均为 1000 的零用量账单，
+展示不足半分与恰好半分的区别。示例每一步失败都立即 `panic` 停止，不会
+继续输出貌似成功的账单。该示例以 Example 测试形式保存在
+`meter/bill_amount_example_test.go`，`go test ./...` 会校验其输出：
+
+```go
+jan := meter.MonthOf(mustParseTime("2026-01-01T00:00:00Z"))
+
+// 把当前时刻固定在 2026-02-01 00:00 UTC：2026-01 账期恰好结束，
+// 可以立即为一月出账；复制后在任何真实日期运行结果都相同。
+now := mustParseTime("2026-02-01T00:00:00Z")
+s := meter.NewServiceWithClock(func() time.Time { return now })
+
+// 主示例套餐 plan-small：月费 3 分、包含 2 单位、超额单价 3 分、
+// 税率 1000（万分比，即 10%）。
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-small", MonthlyFee: 3, IncludedUnits: 2,
+    OveragePrice: 3, TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+// 两个只有月费的套餐，用于展示税前 4 分、5 分在 10% 税率下的舍入：
+// 0.4 分不足半分舍去，0.5 分恰好半分向上。
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-round-down", MonthlyFee: 4, IncludedUnits: 0,
+    OveragePrice: 0, TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-round-half", MonthlyFee: 5, IncludedUnits: 0,
+    OveragePrice: 0, TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+
+for _, id := range []string{
+    "acct-bill", "acct-bill-within", "acct-round-down", "acct-round-half",
+} {
+    if err := s.CreateAccount(id); err != nil {
+        panic(err)
+    }
+}
+
+// 订阅时刻明确：四个账户都在 2026-01-01 00:00 UTC 开通，一月整月
+// 被订阅覆盖，首月按完整月费与完整额度计费。
+if err := s.Subscribe("acct-bill", "plan-small",
+    mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+if err := s.Subscribe("acct-bill-within", "plan-small",
+    mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+if err := s.Subscribe("acct-round-down", "plan-round-down",
+    mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+if err := s.Subscribe("acct-round-half", "plan-round-half",
+    mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+
+// 事件时刻明确：acct-bill 在 1 月 10 日上报 3 单位，按发生时刻
+// 全部归入 2026-01 账期，当月累计为 3。
+ev, err := s.RecordEvent(meter.Event{
+    AccountID: "acct-bill", EventID: "e1",
+    At: mustParseTime("2026-01-10T00:00:00Z"), Quantity: 3,
+})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("event over   accepted=%t period=%s\n", ev.Accepted, ev.Period)
+usage, err := s.MonthlyUsage("acct-bill", jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("usage over   period=%s total=%d\n", usage.Period, usage.Total)
+
+// acct-bill-within 只用 2 单位，恰好等于包含额度，没有超额。
+ev, err = s.RecordEvent(meter.Event{
+    AccountID: "acct-bill-within", EventID: "e1",
+    At: mustParseTime("2026-01-11T00:00:00Z"), Quantity: 2,
+})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("event within accepted=%t period=%s\n", ev.Accepted, ev.Period)
+usage, err = s.MonthlyUsage("acct-bill-within", jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("usage within period=%s total=%d\n", usage.Period, usage.Total)
+
+// 账期结束后修改 plan-small 的定义：一月账单仍按一月适用的开通
+// 快照计费，不套用修改后的定义。
+if err := s.UpdatePlan(meter.Plan{
+    ID: "plan-small", MonthlyFee: 9, IncludedUnits: 0,
+    OveragePrice: 9, TaxRateBasisPoints: 0,
+}); err != nil {
+    panic(err)
+}
+
+// 为一月出账（当前时刻固定在 2026-02-01 00:00 UTC，账期已结束）：
+// 用量 3，超额 3-2=1 单位；超额费 1×3=3 分；月费 3 分完整计入；
+// 税前合计 3+3=6；税额对合计只算一次：6×1000/10000=0.6 分，
+// 四舍五入为 1 分；应付 6+1=7 分。不能分别给两项 3 分费用各算
+// 一次税：0.3+0.3 会被分别舍成 0+0。
+bill, err := s.CreateBill("acct-bill", jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill over   plan=%s monthlyFee=%d includedUnits=%d overageUnits=%d overageFee=%d subtotal=%d taxRateBasisPoints=%d tax=%d totalDue=%d dueAt=%s\n",
+    bill.Terms.PlanID, bill.MonthlyFee, bill.IncludedUnits,
+    bill.OverageUnits, bill.OverageFee, bill.MonthlyFee+bill.OverageFee,
+    bill.Terms.TaxRateBasisPoints, bill.Tax, bill.TotalDue,
+    bill.DueAt.Format(time.RFC3339))
+
+// 恰好用完包含额度：超额单位 0、超额费 0，月费 3 分仍完整计入；
+// 税前 3 分，3×10%=0.3 不足半分，税额 0，应付 3 分。
+within, err := s.CreateBill("acct-bill-within", jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill within plan=%s monthlyFee=%d includedUnits=%d overageUnits=%d overageFee=%d subtotal=%d taxRateBasisPoints=%d tax=%d totalDue=%d dueAt=%s\n",
+    within.Terms.PlanID, within.MonthlyFee, within.IncludedUnits,
+    within.OverageUnits, within.OverageFee, within.MonthlyFee+within.OverageFee,
+    within.Terms.TaxRateBasisPoints, within.Tax, within.TotalDue,
+    within.DueAt.Format(time.RFC3339))
+
+// 税前 4 分：4×10%=0.4 分，不足半分舍去，税额 0，应付 4 分。
+down, err := s.CreateBill("acct-round-down", jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill down   plan=%s subtotal=%d taxRateBasisPoints=%d tax=%d totalDue=%d\n",
+    down.Terms.PlanID, down.MonthlyFee+down.OverageFee,
+    down.Terms.TaxRateBasisPoints, down.Tax, down.TotalDue)
+
+// 税前 5 分：5×10%=0.5 分，恰好半分向上，税额 1，应付 6 分。
+half, err := s.CreateBill("acct-round-half", jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill half   plan=%s subtotal=%d taxRateBasisPoints=%d tax=%d totalDue=%d\n",
+    half.Terms.PlanID, half.MonthlyFee+half.OverageFee,
+    half.Terms.TaxRateBasisPoints, half.Tax, half.TotalDue)
+```
+
+输出（`mustParseTime` 用 `time.Parse(time.RFC3339, value)` 解析上述常量即可）：
+
+```text
+event over   accepted=true period=2026-01
+usage over   period=2026-01 total=3
+event within accepted=true period=2026-01
+usage within period=2026-01 total=2
+bill over   plan=plan-small monthlyFee=3 includedUnits=2 overageUnits=1 overageFee=3 subtotal=6 taxRateBasisPoints=1000 tax=1 totalDue=7 dueAt=2026-02-08T00:00:00Z
+bill within plan=plan-small monthlyFee=3 includedUnits=2 overageUnits=0 overageFee=0 subtotal=3 taxRateBasisPoints=1000 tax=0 totalDue=3 dueAt=2026-02-08T00:00:00Z
+bill down   plan=plan-round-down subtotal=4 taxRateBasisPoints=1000 tax=0 totalDue=4
+bill half   plan=plan-round-half subtotal=5 taxRateBasisPoints=1000 tax=1 totalDue=6
+```
+
+主示例里“必须合并计税、只舍入一次”可以直接用数字核对：月费 3 分与
+超额费 3 分各自的 10% 都是 0.3 分，若错误地分别四舍五入，两项税各为
+0，合计税额 0、应付 6 分；正确做法是先把两项费用相加得到 6 分，再对
+6 分计一次税：0.6 分向上取整为 1 分，应付 7 分。旁边两个小账单把舍入
+边界单独摆出来：同样 10% 税率，税前 4 分的税是 0.4 分（不足半分，舍
+去 → 税额 0、应付 4 分），税前 5 分的税是 0.5 分（恰好半分，向上 →
+税额 1、应付 6 分）。
+
+### 金额超出 int64 时
+
+超额费用（`OverageUnits × OveragePrice`）、税前合计（`MonthlyFee +
+OverageFee`）或含税应付（税前合计 + 税额）中任何一项超出非负 `int64`
+范围时，`CreateBill` 返回可通过 `errors.Is(err, meter.ErrOverflow)`
+识别的 `ErrOverflow`，并返回零值账单：**不会保存账单**（随后 `GetBill`
+仍是 `ErrBillNotFound`，该账期没有被当成已出账而关闭，也不会凭空成为
+欠费来源；重复出账仍是同样的溢出错误），**已有用量保持原值**不变，
+账期仍开放、可以继续补报用量。例如月费取 `int64` 上限、再产生 1 分
+超额费时税前合计溢出；月费 9000000000000000000 分、税率 1000 时税前
+合法，但税额 900000000000000000 分与税前合计之和超过上限，同样返回
+`ErrOverflow`。
+
+需要特别区分**计税中间数**与最终金额：税前金额乘税率的数学乘积本身
+可能超过 `int64` 上限，但这**不代表出账必然失败**。计税按“商与余数
+拆分”的方式完成，不依赖那个巨大的中间乘积；只要最终的超额费、税前
+合计、税额与应付金额都能表示为非负 `int64`，当前功能仍能按分精确
+出账，不误报溢出、也不损失精度。例如税前 8000000000000000005 分、
+税率 1000 时，直接相乘约为 8×10²¹（远超 `int64` 上限
+9223372036854775807），出账仍正常完成：税额 800000000000000001 分、
+应付 8800000000000000006 分。这些边界由
+`meter/bill_large_amounts_test.go` 与
+`meter/bill_overflow_late_usage_test.go` 持续校验。
+
 ## 付款登记
 
 `RecordPayment` 为指定账期的账单分次登记付款，金额单位为分，须大于零且不超过
