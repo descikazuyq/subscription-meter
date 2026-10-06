@@ -249,6 +249,239 @@ bill feb    plan=plan-b totalUsage=25 monthlyFee=2000 includedUnits=20 overageUn
 get bill jan plan=plan-a totalUsage=15 overageFee=500 tax=150 totalDue=1650
 ```
 
+## 按月取消订阅
+
+按月取消涉及三个需要连起来理解的环节：**取消请求**（`CancelSubscription`
+登记安排并返回终止时刻）、**实际终止**（到达终止时刻后订阅立即失效）与
+**取消当月的账单**（终止后仍需显式 `CreateBill` 出账）。
+
+- **终止时刻怎么算。** 终止时刻是取消请求时刻的**下一个 UTC 自然月月初
+  零点**，只按请求瞬间所在的 UTC 自然月计算，不能按调用者本地看到的日期
+  或月份解释：例如 UTC 仍是 1 月 31 日、本地已进入 2 月 1 日时发起取消，
+  终止时刻仍是 2026-02-01 而不是 3 月 1 日。取消在生效前还可用
+  `UndoCancelSubscription` 撤回；终止之后撤回失败。
+- **取消被接受后还能不能提交用量？能。** 从登记取消到终止时刻之前是等待
+  期，订阅照常有效：`Status` 仍显示 `Subscribed=true`、当前套餐保持开通
+  时的原条件快照，并通过 `ScheduledEnd` 展示已安排的终止时刻；期间发生的
+  用量照常接收，终止之后也还能补报终止前、尚未出账的用量（见“用量补报”）。
+  订阅期间按半开区间 `[开通时刻, 终止时刻)` 判定：**开通时刻计入、终止
+  时刻不计入**。
+- **重复取消不是失败，也不后移期限。** 等待期内再次调用
+  `CancelSubscription` 不会新建安排，返回 `Cancelled=false` 和同一个
+  终止时刻。即使第二次请求发生在更晚的日期，终止时刻也保持首次登记时
+  算出的结果。
+- **终止时刻到达即终止，不需要任何“触发”动作。** 到达终止时刻后直接
+  `Status` 就显示 `Subscribed=false`、`CurrentTerms` 为零值、
+  `PendingChange` 与 `ScheduledEnd` 均为空——不必先提交事件，也不必先生成
+  账单。历史用量与账单继续可查；终止后可用 `Subscribe` 重新开通。
+- **这个月为什么仍需出账。** 取消当月仍按**完整月费**计费、提供**完整
+  包含额度**，超额按原单价计，不按天退款、不折减额度；登记取消**不会自动
+  生成账单**，需要像平常一样在账期结束后调用 `CreateBill`。取消也不免除
+  应付款项：账单 `DueAt` 仍是账期结束后七天（UTC），到期未付照样欠费停用，
+  结清债务也不会复活已取消的订阅。
+
+两处容易误用的边界：
+
+- **尚未生效的订阅不能取消。** 提前登记、实际开通时刻尚未到达的订阅，
+  `Status` 显示 `Subscribed=false` 且无终止安排；此时调用
+  `CancelSubscription` 返回 `ErrSubscriptionNotActivated`，而不是登记一份
+  取消。
+- **终止时刻的新用量不属于旧订阅。** 没有重新开通时，发生时刻恰为终止
+  时刻（或之后）的事件返回 `ErrEventBeforeSubscription`，被拒绝且不增加
+  任何账期的累计；拒收不消耗事件标识，重新开通后该标识仍可使用。
+
+下面的示例只用公开入口即可运行：通过 `NewServiceWithClock` 注入可推进的
+时钟，输出不依赖运行当天日期。账户 `acct-cancel` 于 2026-01-01 00:00
+UTC 开通一份没有欠费的订阅，套餐 plan-a 月费 1000 分、每月包含 10 单位、
+超额每单位 100 分、税率 10%。2026-01-15 登记取消，返回终止时刻
+2026-02-01 00:00 UTC；等待期间查询仍显示订阅有效、保留原套餐条件并能
+看到已安排的终止时刻；再次取消返回 `Cancelled=false` 与原终止时刻。
+登记取消后一月仍接收用量，累计 15 单位。到达 2026-02-01 00:00 UTC 后
+直接查询即显示订阅已终止、当前套餐为空且不再展示终止安排；恰在终止时刻
+的新用量被拒绝、二月累计仍为零。随后为一月出账：用量 15、超额 500 分、
+税额 150 分、应付 1650 分，付款截止仍为 2026-02-08 00:00 UTC。示例末尾
+另用一个账户演示尚未生效的订阅不能取消。该示例以 Example 测试形式保存在
+`meter/cancel_monthly_example_test.go`，`go test ./...` 会校验其输出：
+
+```go
+const accountID = "acct-cancel"
+jan := meter.MonthOf(mustParseTime("2026-01-01T00:00:00Z"))
+feb := meter.MonthOf(mustParseTime("2026-02-01T00:00:00Z"))
+
+// 可推进的时钟：初始当前时刻为 2026-01-15 12:00 UTC（一月中旬），
+// 之后推进到二月月初；复制后在任何真实日期运行结果都相同。
+now := mustParseTime("2026-01-15T12:00:00Z")
+s := meter.NewServiceWithClock(func() time.Time { return now })
+
+if err := s.CreateAccount(accountID); err != nil {
+    panic(err)
+}
+// 套餐 plan-a：月费 1000 分、包含 10 单位、超额单价 100 分、税率 10%。
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-a", MonthlyFee: 1000, IncludedUnits: 10,
+    OveragePrice: 100, TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+// 订阅于 2026-01-01 00:00 UTC 开通，开通时保存套餐条件快照。
+if err := s.Subscribe(accountID, "plan-a", mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+
+// 1 月 15 日登记按月取消：终止时刻是请求时刻的下一个 UTC 自然月月初
+// 零点，即 2026-02-01 00:00 UTC。该时刻只按请求瞬间所在的 UTC 自然月
+// 计算，不能按调用者本地显示的月份解释（例如本地已是另一个日期时，
+// 仍以 UTC 为准）。
+r, err := s.CancelSubscription(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("cancel       cancelled=%t endAt=%s\n",
+    r.Cancelled, r.Cancellation.EndAt.Format(time.RFC3339))
+
+// 等待终止期间查询：订阅仍有效，当前仍是开通时保存的原套餐完整条件，
+// 并能看到已安排的终止时刻。
+st, err := s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("status jan15 subscribed=%t plan=%s monthlyFee=%d includedUnits=%d overagePrice=%d taxRateBasisPoints=%d scheduledEnd=%s\n",
+    st.Subscribed, st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.CurrentTerms.IncludedUnits, st.CurrentTerms.OveragePrice,
+    st.CurrentTerms.TaxRateBasisPoints, st.ScheduledEnd.Format(time.RFC3339))
+
+// 等待期间再次取消：本次没有新建安排（Cancelled=false），仍返回原终止
+// 时刻。这不是取消失败，也不会把终止期限后移。
+again, err := s.CancelSubscription(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("cancel again cancelled=%t endAt=%s\n",
+    again.Cancelled, again.Cancellation.EndAt.Format(time.RFC3339))
+
+// 推进到 1 月 28 日（仍在等待终止期间）：登记取消后，一月仍照常接收
+// 用量。两条事件合计 15 单位，全部属于 2026-01 账期，超出套餐包含的
+// 10 单位。
+now = mustParseTime("2026-01-28T00:00:00Z")
+for _, ev := range []meter.Event{
+    {AccountID: accountID, EventID: "e1", At: mustParseTime("2026-01-16T00:00:00Z"), Quantity: 8},
+    {AccountID: accountID, EventID: "e2", At: mustParseTime("2026-01-28T00:00:00Z"), Quantity: 7},
+} {
+    res, err := s.RecordEvent(ev)
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("event %-5s accepted=%t period=%s\n", ev.EventID, res.Accepted, res.Period)
+}
+usage, err := s.MonthlyUsage(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("usage        period=%s total=%d\n", usage.Period, usage.Total)
+
+// 推进到终止时刻 2026-02-01 00:00 UTC：直接查询即显示订阅已终止、
+// 当前套餐为空、待生效换套餐与终止安排都不再展示。无需先提交事件或
+// 生成账单来“促成”终止。
+now = mustParseTime("2026-02-01T00:00:00Z")
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("status feb1  subscribed=%t plan=%s monthlyFee=%d suspended=%t pending=%v scheduledEnd=%v\n",
+    st.Subscribed, st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.Suspended, st.PendingChange, st.ScheduledEnd)
+
+// 没有重新开通：恰在终止时刻发生的新用量不属于旧订阅（终止时刻不计入
+// 订阅期间），被拒绝且不增加累计。
+_, err = s.RecordEvent(meter.Event{
+    AccountID: accountID, EventID: "e-end",
+    At: mustParseTime("2026-02-01T00:00:00Z"), Quantity: 1,
+})
+fmt.Printf("event at-end errEventBeforeSubscription=%t\n",
+    errors.Is(err, meter.ErrEventBeforeSubscription))
+usage, err = s.MonthlyUsage(accountID, feb)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("usage        period=%s total=%d\n", usage.Period, usage.Total)
+
+// 历史用量在终止后继续可查：一月累计仍是 15。
+usage, err = s.MonthlyUsage(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("history      period=%s total=%d\n", usage.Period, usage.Total)
+
+// 为一月出账：取消当月仍收完整月费、提供完整额度，不按天退款；取消也
+// 不会自动生成账单，需要显式调用 CreateBill。用量 15，超额
+// 5 × 100 = 500 分；税 (1000+500) × 10% = 150 分；应付 1650 分。
+janBill, err := s.CreateBill(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill jan     plan=%s totalUsage=%d monthlyFee=%d includedUnits=%d overageUnits=%d overageFee=%d tax=%d totalDue=%d dueAt=%s\n",
+    janBill.Terms.PlanID, janBill.TotalUsage, janBill.MonthlyFee,
+    janBill.IncludedUnits, janBill.OverageUnits, janBill.OverageFee,
+    janBill.Tax, janBill.TotalDue, janBill.DueAt.Format(time.RFC3339))
+
+// 取消不免除应付款项：账单余额仍是 1650 分、尚未结清，付款截止仍是
+// 账期结束后七天，即 2026-02-08 00:00 UTC，不因取消而改变。
+current, err := s.GetBill(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("get bill     totalDue=%d balance=%d settled=%t dueAt=%s\n",
+    current.TotalDue, current.Balance, current.Settled,
+    current.DueAt.Format(time.RFC3339))
+
+// 边界：另一个账户提前登记了 2026-03-01 00:00 UTC 才开通的订阅，
+// 当前时刻（2026-02-20 UTC）尚未到达实际开通时刻。查询不显示有效
+// 订阅，也没有终止安排；此时登记取消返回订阅尚未生效的错误。
+const futureAccount = "acct-cancel-future"
+futureNow := mustParseTime("2026-02-20T00:00:00Z")
+s2 := meter.NewServiceWithClock(func() time.Time { return futureNow })
+if err := s2.CreateAccount(futureAccount); err != nil {
+    panic(err)
+}
+if err := s2.CreatePlan(meter.Plan{
+    ID: "plan-a", MonthlyFee: 1000, IncludedUnits: 10,
+    OveragePrice: 100, TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+if err := s2.Subscribe(futureAccount, "plan-a", mustParseTime("2026-03-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+early, err := s2.Status(futureAccount)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("early status subscribed=%t plan=%s scheduledEnd=%v\n",
+    early.Subscribed, early.CurrentTerms.PlanID, early.ScheduledEnd)
+_, err = s2.CancelSubscription(futureAccount)
+fmt.Printf("early cancel errSubscriptionNotActivated=%t\n",
+    errors.Is(err, meter.ErrSubscriptionNotActivated))
+```
+
+输出（`mustParseTime` 用 `time.Parse(time.RFC3339, value)` 解析上述常量即可）：
+
+```text
+cancel       cancelled=true endAt=2026-02-01T00:00:00Z
+status jan15 subscribed=true plan=plan-a monthlyFee=1000 includedUnits=10 overagePrice=100 taxRateBasisPoints=1000 scheduledEnd=2026-02-01T00:00:00Z
+cancel again cancelled=false endAt=2026-02-01T00:00:00Z
+event e1    accepted=true period=2026-01
+event e2    accepted=true period=2026-01
+usage        period=2026-01 total=15
+status feb1  subscribed=false plan= monthlyFee=0 suspended=false pending=<nil> scheduledEnd=<nil>
+event at-end errEventBeforeSubscription=true
+usage        period=2026-02 total=0
+history      period=2026-01 total=15
+bill jan     plan=plan-a totalUsage=15 monthlyFee=1000 includedUnits=10 overageUnits=5 overageFee=500 tax=150 totalDue=1650 dueAt=2026-02-08T00:00:00Z
+get bill     totalDue=1650 balance=1650 settled=false dueAt=2026-02-08T00:00:00Z
+early status subscribed=false plan= scheduledEnd=<nil>
+early cancel errSubscriptionNotActivated=true
+```
+
 ## 付款登记
 
 `RecordPayment` 为指定账期的账单分次登记付款，金额单位为分，须大于零且不超过
