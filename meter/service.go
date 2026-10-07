@@ -652,6 +652,73 @@ func (s *Service) GetBill(accountID string, period Month) (Bill, error) {
 	return rec.bill, nil
 }
 
+// EstimateCurrentBill 预估当前账期（查询时刻所在的 UTC 自然月）截至查询时刻的
+// 应付金额：订阅已实际生效的账户在月份尚未结束时即可查看，不必先出账。
+// 只计算已接收的用量；没有任何用量时也可查询，累计与超额用量为零，
+// 月费与税额照常计算。
+//
+// 计价规则与正式出账相同：使用订阅保存的当月套餐条件快照，收取完整月费并
+// 提供完整额度（月中开通不按天折算），超额部分按快照单价计算，税额以月费与
+// 超额费用之和为基数按万分比四舍五入到分。尚未生效的换套餐安排不混入本月
+// 预估；到达安排生效月月初后，查询直接使用安排接受时锁定的条件，无需先上报
+// 用量。已登记按月取消但尚未到终止时刻的账户当月仍完整计费；因欠费停用但
+// 订阅仍生效的账户也可查询，查询本身不解除停用。
+//
+// 查询不产生任何副作用：不保存正式账单、不关闭当月、不产生欠费，也不改变
+// 已有账单的金额与付款状态；查询之后同月合法的新用量仍按原规则接收，再次
+// 查询反映新增累计量。正式出账仍只处理已经结束的月份。
+//
+// 超额费用、税前合计或预计应付金额超出非负 int64 范围时返回 ErrOverflow，
+// 不返回部分金额。账户不存在返回 ErrAccountNotFound；从未开通或订阅已终止
+// 返回 ErrSubscriptionNotFound；提前登记但开通时刻尚未到达返回
+// ErrSubscriptionNotActivated；这些情况下不输出预估。
+func (s *Service) EstimateCurrentBill(accountID string) (BillEstimate, error) {
+	if accountID == "" {
+		return BillEstimate{}, invalidf("account id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return BillEstimate{}, ErrAccountNotFound
+	}
+	now := s.nowUTC()
+	// 与其他入口保持一致：先让已到期的换套餐/取消落入历史。到达换套餐
+	// 生效月月初后，这里即把安排锁定的条件追加进条件时间线，下面的预估
+	// 因此直接使用锁定快照，无需先上报用量或出账。
+	s.settleLocked(acc, now)
+	if acc.sub == nil {
+		// 从未开通，或订阅已到达终止时刻（段已移入历史）。
+		return BillEstimate{}, ErrSubscriptionNotFound
+	}
+	if now.Before(acc.sub.activatedAt) {
+		// 提前登记、开通时刻尚未到达：不输出预估。
+		return BillEstimate{}, ErrSubscriptionNotActivated
+	}
+
+	period := MonthOf(now)
+	terms := termsForPeriod(acc.sub, period)
+	usage := acc.usage[period]
+	overageUnits, overageFee, tax, totalDue, err := chargeAmounts(terms, usage)
+	if err != nil {
+		return BillEstimate{}, err
+	}
+	return BillEstimate{
+		AccountID:     accountID,
+		Period:        period,
+		Estimated:     true,
+		Terms:         terms,
+		TotalUsage:    usage,
+		IncludedUnits: terms.IncludedUnits,
+		OverageUnits:  overageUnits,
+		MonthlyFee:    terms.MonthlyFee,
+		OverageFee:    overageFee,
+		Tax:           tax,
+		TotalDue:      totalDue,
+	}, nil
+}
+
 // RecordPayment 为指定账单登记一笔大于零且不超过余额的本地付款，支持分次登记。
 // 付款标识在同一账户内去重：相同账单和金额的重报仍成功，但本次不再登记
 // （Registered 为 false），也不再次增加已付金额；返回的付款内容、账单余额与
@@ -854,27 +921,36 @@ func mulNonNeg(a, b int64) (int64, bool) {
 	return a * b, true
 }
 
-// buildBill 依据套餐快照和账期总用量计算账单，所有金额运算做溢出检查。
-func buildBill(accountID string, period Month, t PlanTerms, totalUsage int64) (Bill, error) {
-	overageUnits := int64(0)
+// chargeAmounts 按套餐条件快照与账期累计用量计算超额用量与各项金额，
+// 所有金额运算做溢出检查。正式出账与当前账期预估共用这一份计价规则：
+// 完整月费、完整额度、超额按快照单价、税额以月费与超额费用之和为基数
+// 按万分比四舍五入到分。
+func chargeAmounts(t PlanTerms, totalUsage int64) (overageUnits, overageFee, tax, totalDue int64, err error) {
 	if totalUsage > t.IncludedUnits {
 		overageUnits = totalUsage - t.IncludedUnits
 	}
-	overageFee, ok := mulNonNeg(overageUnits, t.OveragePrice)
-	if !ok {
-		return Bill{}, ErrOverflow
+	var ok bool
+	if overageFee, ok = mulNonNeg(overageUnits, t.OveragePrice); !ok {
+		return 0, 0, 0, 0, ErrOverflow
 	}
 	subtotal, ok := addNonNeg(t.MonthlyFee, overageFee)
 	if !ok {
-		return Bill{}, ErrOverflow
+		return 0, 0, 0, 0, ErrOverflow
 	}
-	tax, ok := rateAmount(subtotal, t.TaxRateBasisPoints)
-	if !ok {
-		return Bill{}, ErrOverflow
+	if tax, ok = rateAmount(subtotal, t.TaxRateBasisPoints); !ok {
+		return 0, 0, 0, 0, ErrOverflow
 	}
-	totalDue, ok := addNonNeg(subtotal, tax)
-	if !ok {
-		return Bill{}, ErrOverflow
+	if totalDue, ok = addNonNeg(subtotal, tax); !ok {
+		return 0, 0, 0, 0, ErrOverflow
+	}
+	return overageUnits, overageFee, tax, totalDue, nil
+}
+
+// buildBill 依据套餐快照和账期总用量计算账单，所有金额运算做溢出检查。
+func buildBill(accountID string, period Month, t PlanTerms, totalUsage int64) (Bill, error) {
+	overageUnits, overageFee, tax, totalDue, err := chargeAmounts(t, totalUsage)
+	if err != nil {
+		return Bill{}, err
 	}
 	b := Bill{
 		AccountID:     accountID,

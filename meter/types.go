@@ -178,6 +178,36 @@ type Bill struct {
 	DueAt time.Time
 }
 
+// BillEstimate 是当前账期截至查询时刻的应付金额预估。
+// 它只是查询结果：不生成正式账单、不关闭账期、不产生欠费，
+// 也不改变已有账单的金额与付款状态；同月后续接收的新用量会在
+// 下次查询的累计量中反映。
+type BillEstimate struct {
+	AccountID string
+	// Period 预估账期：查询时刻所在的 UTC 自然月。
+	Period Month
+	// Estimated 恒为 true，标明这是预估而非正式账单。
+	Estimated bool
+	// Terms 预估采用的套餐条件：当前账期实际适用的完整条件快照
+	// （开通快照或某次已生效换套餐安排锁定的快照）。尚未生效的
+	// 换套餐安排与之后的套餐定义修改都不混入本月预估。
+	Terms PlanTerms
+	// TotalUsage 账期内截至查询时刻已接收的累计用量。
+	TotalUsage int64
+	// IncludedUnits 包含额度（月中开通也给完整额度，不按天折算）。
+	IncludedUnits int64
+	// OverageUnits 超额用量 = max(0, TotalUsage - IncludedUnits)。
+	OverageUnits int64
+	// MonthlyFee 月费（分），月中开通也收完整月费。
+	MonthlyFee int64
+	// OverageFee 超额费用（分），按条件快照中的单价计算。
+	OverageFee int64
+	// Tax 税额（分），对月费与超额费用之和按万分比四舍五入。
+	Tax int64
+	// TotalDue 预计应付金额（分）= MonthlyFee + OverageFee + Tax。
+	TotalDue int64
+}
+
 // Payment 是一次本地付款登记记录。
 type Payment struct {
 	AccountID string
