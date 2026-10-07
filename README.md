@@ -20,6 +20,7 @@ go test ./...
 - `CreateBill` / `GetBill`：为已结束且被某段订阅覆盖的账期出账，完全无订阅的空档月份失败；重复出账得到同一张账单；每张账单按该账期当时适用的套餐条件计费。
 - `RecordPayment`：分次登记付款，账户内付款标识去重（详见下文“付款登记”）。
 - `MonthlyUsage` / `Status`：查询各月累计用量、当前生效套餐条件（订阅以实际开通时刻为界，等待开通期间为零值）、待生效安排、已安排的终止时刻、账单余额与欠费停用状态（等待开通不清旧欠费，`Subscribed` 与停用分别表示订阅是否生效与是否存在到期未结清账单）。月度历史列表的收录规则详见下文“月度历史查询”。
+- `EstimateCurrentBill`：账期尚未结束时查询当前 UTC 自然月截至查询时刻的**预计账单**（结果以 `Estimated=true` 明确标为预估），不必先出账；纯读操作，不保存账单、不关闭当月、不产生欠费（详见下文“账期内预计费用查询”）。
 
 金额与用量均为非负 `int64`，金额单位为分，税率为万分比（0–10000）。
 到期欠费的账户会被停用，结清全部到期欠费账单后恢复；结清债务不复活已取消的订阅。
@@ -905,6 +906,188 @@ OverageFee`）或含税应付（税前合计 + 税额）中任何一项超出非
 应付 8800000000000000006 分。这些边界由
 `meter/bill_large_amounts_test.go` 与
 `meter/bill_overflow_late_usage_test.go` 持续校验。
+
+## 账期内预计费用查询
+
+`EstimateCurrentBill` 在账期尚未结束时回答“**按现在已经接收的用量，本月
+预计要付多少钱**”。它与正式出账的区别只在时点，不在计价规则：
+
+- **只查当前 UTC 自然月。** 账期固定为服务当前时刻所在的 UTC 自然月，
+  不能指定历史月份；账期不必结束，也不需要先出账。结果中的 `Period`
+  就是这个账期。
+- **结果明确标为预估。** 返回的 `EstimatedBill` 上 `Estimated` 恒为
+  `true`，并给出账期、当前适用的完整套餐条件（`Terms`）、累计用量
+  （`TotalUsage`）、包含额度（`IncludedUnits`）、超额用量
+  （`OverageUnits`）、月费（`MonthlyFee`）、超额费用（`OverageFee`）、
+  税额（`Tax`）与预计应付金额（`EstimatedTotalDue`）；金额单位仍为分。
+  没有任何用量时也能查询：累计与超额用量为零，完整月费与税额照常计算。
+- **与正式出账同一套计价。** 月费按整月收取、额度按整月提供，月中开通
+  也不按天折算；超额单位为 `max(0, TotalUsage - IncludedUnits)`，按
+  **订阅保存的当月套餐条件快照**中的超额单价计费；税额以月费与超额费用
+  之和为基数，按快照中的万分比税率四舍五入到分（不足半分舍去、恰好半分
+  向上）。`UpdatePlan` 修改套餐定义不会改写已保存的订阅快照。
+- **尚未生效的换套餐安排不会提前混入本月预估。** 安排只在生效月月初
+  零点（与其他入口一样由查询时的状态结算自动承认）之后才成为当月条件；
+  到达后**直接查询**就使用安排接受时锁定的条件，不依赖先上报用量，
+  修改套餐定义同样不影响该锁定快照。
+- **纯读操作，没有任何副作用。** 查询不保存正式账单、不关闭当月、不
+  产生欠费，也不改变已有账单的金额与付款状态；查询之后同月合法的新用量
+  仍按原规则接收（因欠费停用期间的新用量仍被拒绝），再次查询反映新增
+  累计量；换套餐和取消安排仍按原时刻生效。正式出账继续只处理已经结束的
+  月份，预估永远不会把当月变成“已出账”。
+- **等待取消与欠费停用期间都可查询。** 已登记按月取消但尚未到终止时刻
+  的订阅仍生效，当月按完整月费与额度预估；因欠费暂停接收新用量但订阅仍
+  生效的账户也可查询，查询本身不会解除停用。
+- **不可预估的情况各自返回已有错误，不输出预估。** 账户不存在返回
+  `ErrAccountNotFound`；从未开通、订阅已经终止（含已到终止时刻）返回
+  `ErrSubscriptionNotFound`；提前登记但开通时刻尚未到达返回
+  `ErrSubscriptionNotActivated`。
+- **金额溢出与正式出账同样处理。** 超额费用、税前合计或预计应付金额超出
+  非负 `int64` 范围时返回 `ErrOverflow`，不返回部分金额；预估不落库，
+  因此不会留下任何需要清理的中间结果。
+
+由于预估只统计**已接收**的用量，账期结束后若没有新增用量，正式出账
+（`CreateBill`）的各项金额与最后一次预估一致；期间又接收了用量时，正式
+账单按出账时的累计计算，金额可能高于预估。
+
+下面的示例只用公开入口即可运行：通过 `NewServiceWithClock` 注入可推进的
+时钟，输出不依赖运行当天日期。账户 `acct-estimate` 2026-01-10 12:00 UTC
+开通 plan-est（月费 1000 分、包含 10 单位、超额单价 100 分、税率 10%），
+月中开通也按整月计费。示例依次展示：无用量时预估仍收完整月费与税额；
+接收 15 单位后再次预估，超额 5 单位、超额费 500 分、税 150 分、预计
+应付 1650 分；一月中旬安排二月换套餐并把套餐定义改价，一月预估不混入
+新安排也不被改价影响；推进到二月月初后直接预估即使用安排时锁定的
+plan-b 条件（2000/20/200/600）。该示例以 Example 测试形式保存在
+`meter/estimate_example_test.go`，`go test ./...` 会校验其输出：
+
+```go
+// 可推进的时钟：初始当前时刻为 2026-01-10 12:00 UTC（一月中旬）。
+now := mustParseTime("2026-01-10T12:00:00Z")
+s := meter.NewServiceWithClock(func() time.Time { return now })
+
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-est", MonthlyFee: 1000, IncludedUnits: 10,
+    OveragePrice: 100, TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-b", MonthlyFee: 2000, IncludedUnits: 20,
+    OveragePrice: 200, TaxRateBasisPoints: 600,
+}); err != nil {
+    panic(err)
+}
+if err := s.CreateAccount("acct-estimate"); err != nil {
+    panic(err)
+}
+// 月中开通：当月仍按完整月费与完整额度预估，不按天折算。
+if err := s.Subscribe("acct-estimate", "plan-est",
+    mustParseTime("2026-01-10T12:00:00Z")); err != nil {
+    panic(err)
+}
+
+// 无任何用量也能预估：累计与超额为零，月费 1000 分完整计入，
+// 税 1000×10%=100 分，预计应付 1100 分。
+e, err := s.EstimateCurrentBill("acct-estimate")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("no usage    estimated=%t period=%s plan=%s totalUsage=%d overageUnits=%d monthlyFee=%d overageFee=%d tax=%d totalDue=%d\n",
+    e.Estimated, e.Period, e.Terms.PlanID, e.TotalUsage, e.OverageUnits,
+    e.MonthlyFee, e.OverageFee, e.Tax, e.EstimatedTotalDue)
+
+// 推进到一月中旬再上报并预估。
+now = mustParseTime("2026-01-15T12:00:00Z")
+// 接收 15 单位：超额 5 × 100 = 500 分；税 (1000+500) × 10% = 150 分。
+if _, err := s.RecordEvent(meter.Event{
+    AccountID: "acct-estimate", EventID: "e1",
+    At: mustParseTime("2026-01-12T00:00:00Z"), Quantity: 15,
+}); err != nil {
+    panic(err)
+}
+e, err = s.EstimateCurrentBill("acct-estimate")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("with usage  estimated=%t period=%s totalUsage=%d includedUnits=%d overageUnits=%d monthlyFee=%d overageFee=%d tax=%d totalDue=%d\n",
+    e.Estimated, e.Period, e.TotalUsage, e.IncludedUnits, e.OverageUnits,
+    e.MonthlyFee, e.OverageFee, e.Tax, e.EstimatedTotalDue)
+
+// 预估不保存账单、不关闭当月。
+if _, err := s.GetBill("acct-estimate", meter.MonthOf(now)); err != nil {
+    fmt.Printf("bill saved errBillNotFound=%t\n", errors.Is(err, meter.ErrBillNotFound))
+}
+
+// 一月中旬安排二月换到 plan-b，随后修改 plan-est 与 plan-b 的定义：
+// 一月预估继续使用订阅快照，二月安排继续使用安排时锁定的快照。
+if _, err := s.SchedulePlanChange("acct-estimate", "plan-b"); err != nil {
+    panic(err)
+}
+if err := s.UpdatePlan(meter.Plan{
+    ID: "plan-est", MonthlyFee: 9, IncludedUnits: 0,
+    OveragePrice: 9, TaxRateBasisPoints: 0,
+}); err != nil {
+    panic(err)
+}
+if err := s.UpdatePlan(meter.Plan{
+    ID: "plan-b", MonthlyFee: 5000, IncludedUnits: 5,
+    OveragePrice: 900, TaxRateBasisPoints: 2500,
+}); err != nil {
+    panic(err)
+}
+e, err = s.EstimateCurrentBill("acct-estimate")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("jan kept    plan=%s monthlyFee=%d overagePrice=%d taxRateBasisPoints=%d totalDue=%d\n",
+    e.Terms.PlanID, e.MonthlyFee, e.Terms.OveragePrice,
+    e.Terms.TaxRateBasisPoints, e.EstimatedTotalDue)
+
+// 推进到 2026-02-01 00:00 UTC：安排已生效，直接预估即使用安排接受时
+// 锁定的 plan-b 条件（2000/20/200/600），无须先上报用量；二月尚无
+// 用量，月费 2000、税 2000×6%=120、预计应付 2120。
+now = mustParseTime("2026-02-01T00:00:00Z")
+e, err = s.EstimateCurrentBill("acct-estimate")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("feb terms   estimated=%t period=%s plan=%s monthlyFee=%d includedUnits=%d overagePrice=%d taxRateBasisPoints=%d totalUsage=%d totalDue=%d\n",
+    e.Estimated, e.Period, e.Terms.PlanID, e.MonthlyFee, e.IncludedUnits,
+    e.Terms.OveragePrice, e.Terms.TaxRateBasisPoints,
+    e.TotalUsage, e.EstimatedTotalDue)
+
+// 不可预估的情况：不存在的账户、从未开通的账户、提前登记但开通时刻
+// 未到的账户，分别返回各自的已有错误。
+if err := s.CreateAccount("acct-no-sub"); err != nil {
+    panic(err)
+}
+_, err = s.EstimateCurrentBill("ghost")
+fmt.Printf("ghost       errAccountNotFound=%t\n", errors.Is(err, meter.ErrAccountNotFound))
+_, err = s.EstimateCurrentBill("acct-no-sub")
+fmt.Printf("no sub      errSubscriptionNotFound=%t\n", errors.Is(err, meter.ErrSubscriptionNotFound))
+if err := s.CreateAccount("acct-future-sub"); err != nil {
+    panic(err)
+}
+if err := s.Subscribe("acct-future-sub", "plan-est",
+    mustParseTime("2026-02-10T00:00:00Z")); err != nil {
+    panic(err)
+}
+_, err = s.EstimateCurrentBill("acct-future-sub")
+fmt.Printf("future sub  errSubscriptionNotActivated=%t\n", errors.Is(err, meter.ErrSubscriptionNotActivated))
+```
+
+输出（`mustParseTime` 用 `time.Parse(time.RFC3339, value)` 解析上述常量即可）：
+
+```text
+no usage    estimated=true period=2026-01 plan=plan-est totalUsage=0 overageUnits=0 monthlyFee=1000 overageFee=0 tax=100 totalDue=1100
+with usage  estimated=true period=2026-01 totalUsage=15 includedUnits=10 overageUnits=5 monthlyFee=1000 overageFee=500 tax=150 totalDue=1650
+bill saved  errBillNotFound=true
+jan kept    plan=plan-est monthlyFee=1000 overagePrice=100 taxRateBasisPoints=1000 totalDue=1650
+feb terms   estimated=true period=2026-02 plan=plan-b monthlyFee=2000 includedUnits=20 overagePrice=200 taxRateBasisPoints=600 totalUsage=0 totalDue=2120
+ghost       errAccountNotFound=true
+no sub      errSubscriptionNotFound=true
+future sub  errSubscriptionNotActivated=true
+```
 
 ## 付款登记
 

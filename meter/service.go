@@ -743,6 +743,81 @@ func (s *Service) MonthlyUsage(accountID string, period Month) (Usage, error) {
 	return Usage{Period: period, Total: acc.usage[period]}, nil
 }
 
+// EstimateCurrentBill 返回账户当前账期（服务当前时刻所在的 UTC 自然月）
+// 截至查询时刻的预计账单。结果明确标为预估（Estimated 恒为 true）：账期
+// 不必结束，也不需要先出账，按已接收的当月累计用量试算；没有任何用量时
+// 也能查询，累计与超额用量为零，完整月费与税额照常计算。
+//
+// 计价完全沿用正式出账规则（与 CreateBill 同一套计算）：使用订阅保存的
+// 当月套餐条件快照，收取完整月费并提供完整额度，月中开通也不按天折算；
+// 超过额度的部分按快照中的超额单价计费；税额以月费与超额费用之和为基数，
+// 按万分比税率四舍五入到分。尚未生效的换套餐安排不会提前混入——它只在
+// 生效月月初 settleLocked 落入条件时间线后才成为当月条件，直接查询即可
+// 使用安排接受时锁定的快照，不依赖先上报用量；之后修改套餐定义同样不改
+// 写已保存的订阅或安排快照。
+//
+// 查询是纯读操作：不保存正式账单、不关闭当月、不产生欠费，也不改变已有
+// 账单的金额与付款状态，更不会解除欠费停用。查询之后同月合法的新用量仍
+// 按原规则接收，换套餐与取消安排仍按原时刻生效；正式出账继续只处理已经
+// 结束的月份。已登记按月取消但尚未到终止时刻的账户当月完整计费、仍可
+// 查询；因欠费暂停接收新用量但订阅仍生效的账户也可查询。
+//
+// 超额费用、税前合计或预计应付金额超出非负 int64 范围时返回 ErrOverflow，
+// 不返回部分金额，也不留任何副作用。
+//
+// 账户不存在返回 ErrAccountNotFound；从未开通、订阅已经终止（含已到终止
+// 时刻）返回 ErrSubscriptionNotFound；提前登记但开通时刻尚未到达返回
+// ErrSubscriptionNotActivated——这些情况都不输出预估。
+func (s *Service) EstimateCurrentBill(accountID string) (EstimatedBill, error) {
+	if accountID == "" {
+		return EstimatedBill{}, invalidf("account id is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	acc, ok := s.accounts[accountID]
+	if !ok {
+		return EstimatedBill{}, ErrAccountNotFound
+	}
+
+	now := s.nowUTC()
+	// 与其他入口保持一致：查询即让已到生效时刻的换套餐安排落入条件
+	// 时间线、让已到终止时刻的取消生效。这一步只推进订阅自身状态，
+	// 不生成账单、不改变用量与付款。
+	s.settleLocked(acc, now)
+
+	// 从未开通，或当前订阅段已到终止时刻（settleLocked 已移入 history），
+	// 都按无订阅处理；提前登记、开通时刻未到单独报尚未生效。
+	// 两种情况都不输出预估。
+	if acc.sub == nil {
+		return EstimatedBill{}, ErrSubscriptionNotFound
+	}
+	if now.Before(acc.sub.activatedAt) {
+		return EstimatedBill{}, ErrSubscriptionNotActivated
+	}
+
+	// 预估只针对服务当前时刻所在的 UTC 自然月；条件、用量都只取当月。
+	period := MonthOf(now)
+	terms := termsForPeriod(acc.sub, period)
+	a, err := computeBillAmounts(terms, acc.usage[period])
+	if err != nil {
+		return EstimatedBill{}, err
+	}
+	return EstimatedBill{
+		AccountID:         accountID,
+		Estimated:         true,
+		Period:            period,
+		Terms:             terms,
+		TotalUsage:        a.totalUsage,
+		IncludedUnits:     a.includedUnits,
+		OverageUnits:      a.overageUnits,
+		MonthlyFee:        a.monthlyFee,
+		OverageFee:        a.overageFee,
+		Tax:               a.tax,
+		EstimatedTotalDue: a.totalDue,
+	}, nil
+}
+
 // Status 返回账户状态：各月累计用量、各账单余额以及当前是否因欠费停用。
 func (s *Service) Status(accountID string) (AccountStatus, error) {
 	if accountID == "" {
@@ -854,42 +929,72 @@ func mulNonNeg(a, b int64) (int64, bool) {
 	return a * b, true
 }
 
-// buildBill 依据套餐快照和账期总用量计算账单，所有金额运算做溢出检查。
-func buildBill(accountID string, period Month, t PlanTerms, totalUsage int64) (Bill, error) {
+// billAmounts 依据套餐快照与账期总用量计算计价明细，不含付款状态。
+// 正式出账（buildBill）与当月预估（EstimateCurrentBill）共用这里的全部
+// 计价规则：完整月费与完整额度、超额单价取快照、税额只对“月费+超额费”
+// 之和按万分比四舍五入一次。所有金额运算做溢出检查。
+type billAmounts struct {
+	totalUsage    int64
+	includedUnits int64
+	overageUnits  int64
+	monthlyFee    int64
+	overageFee    int64
+	tax           int64
+	totalDue      int64
+}
+
+func computeBillAmounts(t PlanTerms, totalUsage int64) (billAmounts, error) {
 	overageUnits := int64(0)
 	if totalUsage > t.IncludedUnits {
 		overageUnits = totalUsage - t.IncludedUnits
 	}
 	overageFee, ok := mulNonNeg(overageUnits, t.OveragePrice)
 	if !ok {
-		return Bill{}, ErrOverflow
+		return billAmounts{}, ErrOverflow
 	}
 	subtotal, ok := addNonNeg(t.MonthlyFee, overageFee)
 	if !ok {
-		return Bill{}, ErrOverflow
+		return billAmounts{}, ErrOverflow
 	}
 	tax, ok := rateAmount(subtotal, t.TaxRateBasisPoints)
 	if !ok {
-		return Bill{}, ErrOverflow
+		return billAmounts{}, ErrOverflow
 	}
 	totalDue, ok := addNonNeg(subtotal, tax)
 	if !ok {
-		return Bill{}, ErrOverflow
+		return billAmounts{}, ErrOverflow
+	}
+	return billAmounts{
+		totalUsage:    totalUsage,
+		includedUnits: t.IncludedUnits,
+		overageUnits:  overageUnits,
+		monthlyFee:    t.MonthlyFee,
+		overageFee:    overageFee,
+		tax:           tax,
+		totalDue:      totalDue,
+	}, nil
+}
+
+// buildBill 依据套餐快照和账期总用量计算账单，所有金额运算做溢出检查。
+func buildBill(accountID string, period Month, t PlanTerms, totalUsage int64) (Bill, error) {
+	a, err := computeBillAmounts(t, totalUsage)
+	if err != nil {
+		return Bill{}, err
 	}
 	b := Bill{
 		AccountID:     accountID,
 		Period:        period,
 		Terms:         t,
-		TotalUsage:    totalUsage,
-		IncludedUnits: t.IncludedUnits,
-		OverageUnits:  overageUnits,
-		MonthlyFee:    t.MonthlyFee,
-		OverageFee:    overageFee,
-		Tax:           tax,
-		TotalDue:      totalDue,
+		TotalUsage:    a.totalUsage,
+		IncludedUnits: a.includedUnits,
+		OverageUnits:  a.overageUnits,
+		MonthlyFee:    a.monthlyFee,
+		OverageFee:    a.overageFee,
+		Tax:           a.tax,
+		TotalDue:      a.totalDue,
 		Paid:          0,
-		Balance:       totalDue,
-		Settled:       totalDue == 0,
+		Balance:       a.totalDue,
+		Settled:       a.totalDue == 0,
 		DueAt:         period.End().AddDate(0, 0, 7),
 	}
 	return b, nil
