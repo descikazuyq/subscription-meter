@@ -1583,6 +1583,299 @@ event e1    accepted=true period=2026-02
 usage       period=2026-02 total=3
 ```
 
+## 终止后重新开通与补开旧账单
+
+订阅按月终止后，用同一个 `Subscribe` 入口即可重新开通；旧订阅覆盖的已结束
+月份在任何时候都能用 `CreateBill` 补开，包括先出了新月份账单、再回头补旧
+月份。这里最容易混淆的是“**当前在用的条件**”与“**某张旧账单的条件**”分别
+来自哪一次开通：
+
+- **每次开通各存一份快照，按订阅段归属。** `Subscribe` 成功时保存当时套餐
+  定义的完整条件（月费、包含额度、超额单价、税率），这份快照只属于这一段
+  订阅。账户**当前正在使用**的套餐条件取自**最近一次（重新）开通**保存的
+  快照；为指定旧账期出账时，条件取自**当时覆盖该账期的那次开通**保存的
+  快照。先出新月账单再补旧月账单，也不会让旧账期被新订阅段覆盖。
+- **沿用同一个套餐标识，不代表沿用旧价格。** 空档期间用 `UpdatePlan` 改了
+  套餐定义，再用同一个套餐标识重新开通，新订阅保存的是**重新开通当时的新
+  定义**；而已终止的旧订阅段仍持旧快照，旧月份账单照旧价计算。反过来，
+  **补开旧账单也不会把当前套餐改回旧价格**——出账只读对应订阅段的快照，
+  不改动当前订阅。
+- **重新开通当月按完整月费与完整额度计费，月中开通不按天折算。** 但用量
+  事件仍按实际发生时刻判断是否落在订阅期间（开通计入、终止不计入）：重新
+  开通之前、同一自然月内发生的事件仍属空档，会被拒绝，不能因为“该月可
+  整月出账”而补报。
+- **空档月份不能出账，错误与“早于第一次开通”是同一个。** 完全没有订阅
+  覆盖的月份——无论是早于首次开通，还是两段订阅之间的**空档**——`CreateBill`
+  都返回 `ErrBillBeforeSubscription`。不要把这个错误只理解成“月份早于第一
+  次开通”：它的含义是“该账期不被任何订阅段覆盖”，空档月份同样适用。失败
+  不保存账单，随后 `GetBill` 得到 `ErrBillNotFound`；之后重新开通也不会把
+  空档变成可出账月份。
+- **付款截止不随补账顺延，补开旧账可能当即带来欠费停用。** 每张账单的
+  `DueAt` 都固定为**自身账期结束后七天**（UTC）：一月账单的截止是 2 月
+  8 日，三月账单的截止是 4 月 8 日，四月才补开一月账单不会把它的截止推到
+  四月。补开时若截止时刻已过且账单有余额，账户**立即欠费停用**，新用量会
+  被 `ErrSuspended` 拒绝（订阅本身仍有效）；结清全部到期欠费后恢复。
+
+下面的示例只用公开入口即可运行：通过 `NewServiceWithClock` 注入可推进的
+时钟，输出不依赖运行当天日期。账户 `acct-resub` 与套餐标识 `plan-a` 始终
+是同一个：2026-01-01 00:00 UTC 首次开通时 plan-a 为月费 1000 分、包含 10
+单位、超额单价 100 分、税率 10%；一月上报 15 单位，1 月 15 日登记取消、
+2 月 1 日零点终止，一月暂不出账。二月整月没有订阅，期间把 plan-a 的定义
+改为月费 2000 分、包含 20 单位、超额单价 200 分、税率 6%。3 月 15 日用同
+一入口、同一套餐标识重新开通（保存新条件），三月上报 25 单位，接收时尚
+无到期未结清账单。4 月 1 日先为三月出账，再补开一月账单。三月账单按重新
+开通时保存的条件收完整月费与完整额度：超额 5 单位、超额费 1000 分、税
+180 分、应付 3180 分；一月账单仍按首次开通的条件：超额费 500 分、税 150
+分、应付 1650 分。两张账单的付款截止分别是 2 月 8 日与 4 月 8 日 UTC 零
+点；四月补开一月账单时其截止已过，账户当即停用，而当前套餐仍是新价格。
+二月空档出账返回 `ErrBillBeforeSubscription`、查询返回 `ErrBillNotFound`，
+重新开通与补账之后仍然如此。该示例以 Example 测试形式保存在
+`meter/resubscribe_backfill_example_test.go`，`go test ./...` 会校验其输出：
+
+```go
+const accountID = "acct-resub"
+jan := meter.MonthOf(mustParseTime("2026-01-01T00:00:00Z"))
+feb := meter.MonthOf(mustParseTime("2026-02-01T00:00:00Z"))
+mar := meter.MonthOf(mustParseTime("2026-03-01T00:00:00Z"))
+
+// 可推进的时钟：初始当前时刻为 2026-01-01 00:00 UTC，之后逐段推进，
+// 复制后在任何真实日期运行结果都相同。
+now := mustParseTime("2026-01-01T00:00:00Z")
+s := meter.NewServiceWithClock(func() time.Time { return now })
+
+if err := s.CreateAccount(accountID); err != nil {
+    panic(err)
+}
+// plan-a 首次开通时的定义：月费 1000 分、包含 10 单位、超额单价
+// 100 分、税率 10%。一月条件取自这一次开通保存的快照。
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-a", MonthlyFee: 1000, IncludedUnits: 10,
+    OveragePrice: 100, TaxRateBasisPoints: 1000,
+}); err != nil {
+    panic(err)
+}
+// 2026-01-01 00:00 UTC 首次开通。
+if err := s.Subscribe(accountID, "plan-a", mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+
+// 一月中旬上报 15 单位，超出包含的 10 单位；一月暂不出账，因此此时
+// 不存在到期未结清账单，用量正常接收。
+now = mustParseTime("2026-01-15T12:00:00Z")
+ev, err := s.RecordEvent(meter.Event{
+    AccountID: accountID, EventID: "e-jan",
+    At: mustParseTime("2026-01-10T00:00:00Z"), Quantity: 15,
+})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("event e-jan  accepted=%t period=%s\n", ev.Accepted, ev.Period)
+
+// 1 月 15 日登记按月取消：终止时刻为 2026-02-01 00:00 UTC，一月仍按
+// 完整月费与额度计费。
+r, err := s.CancelSubscription(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("cancel       cancelled=%t endAt=%s\n",
+    r.Cancelled, r.Cancellation.EndAt.Format(time.RFC3339))
+
+// 推进到终止时刻：订阅已终止，空档期间查询不显示任何生效套餐，也没有
+// 待取消终止时刻；历史用量继续保留。
+now = mustParseTime("2026-02-01T00:00:00Z")
+st, err := s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("gap status   subscribed=%t currentPlan=%q scheduledEnd=%v\n",
+    st.Subscribed, st.CurrentTerms.PlanID, st.ScheduledEnd)
+
+// 二月整月空档期间，把同一个套餐标识 plan-a 的定义改为新价格：月费
+// 2000 分、包含 20 单位、超额单价 200 分、税率 6%。修改只影响之后
+// 新保存的条件快照，不改写一月旧订阅已经保存的快照。
+now = mustParseTime("2026-02-15T12:00:00Z")
+if err := s.UpdatePlan(meter.Plan{
+    ID: "plan-a", MonthlyFee: 2000, IncludedUnits: 20,
+    OveragePrice: 200, TaxRateBasisPoints: 600,
+}); err != nil {
+    panic(err)
+}
+fmt.Printf("plan updated id=plan-a monthlyFee=2000 includedUnits=20 overagePrice=200 taxRateBasisPoints=600\n")
+
+// 三月一日二月账期已结束：为空档月份二月出账返回 ErrBillBeforeSubscription。
+// 该错误不只表示“早于第一次开通”——两段订阅之间完全无订阅覆盖的空档
+// 月份同样按它拒绝；这次失败不保存账单，随后查询得到 ErrBillNotFound。
+now = mustParseTime("2026-03-01T00:00:00Z")
+_, err = s.CreateBill(accountID, feb)
+fmt.Printf("feb in gap   errBillBeforeSubscription=%t\n",
+    errors.Is(err, meter.ErrBillBeforeSubscription))
+_, err = s.GetBill(accountID, feb)
+fmt.Printf("feb in gap   errBillNotFound=%t\n", errors.Is(err, meter.ErrBillNotFound))
+// 空档月份没有任何用量记录，单月查询为零。
+usage, err := s.MonthlyUsage(accountID, feb)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("feb usage    period=%s total=%d\n", usage.Period, usage.Total)
+
+// 2026-03-15 12:00 UTC 用同一个 Subscribe 入口、同一个套餐标识
+// plan-a 重新开通。沿用标识不代表沿用旧价格：本次开通保存的是重新
+// 开通当时的完整条件 2000/20/200/600；月中开通也按完整月费与完整
+// 额度计三月，不按天折算。
+now = mustParseTime("2026-03-15T12:00:00Z")
+if err := s.Subscribe(accountID, "plan-a", now); err != nil {
+    panic(err)
+}
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("resubscribe  subscribed=%t plan=%s monthlyFee=%d includedUnits=%d overagePrice=%d taxRateBasisPoints=%d\n",
+    st.Subscribed, st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.CurrentTerms.IncludedUnits, st.CurrentTerms.OveragePrice,
+    st.CurrentTerms.TaxRateBasisPoints)
+
+// 三月上报 25 单位，事件发生在重新开通之后、属于已生效的新订阅期间；
+// 接收时一月尚未出账，没有到期未结清账单，不会被欠费停用拦截。
+ev, err = s.RecordEvent(meter.Event{
+    AccountID: accountID, EventID: "e-mar",
+    At: mustParseTime("2026-03-15T12:00:00Z"), Quantity: 25,
+})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("event e-mar  accepted=%t period=%s\n", ev.Accepted, ev.Period)
+
+// 推进到 2026-04-01 00:00 UTC：三月账期结束。此时还没有任何账单，
+// 账户未停用，当前套餐是重新开通保存的新条件。
+now = mustParseTime("2026-04-01T00:00:00Z")
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("before bills subscribed=%t suspended=%t currentPlan=%s monthlyFee=%d\n",
+    st.Subscribed, st.Suspended, st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee)
+
+// 先为三月出账：按重新开通时保存的条件收完整月费、给完整额度。
+// 用量 25、超额 25-20=5；超额费 5×200=1000；
+// 税 (2000+1000)×6%=180；应付 3180。付款截止为三月结束后七天，
+// 即 2026-04-08 00:00 UTC（此刻尚未到期）。
+marBill, err := s.CreateBill(accountID, mar)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill mar     period=%s plan=%s monthlyFee=%d includedUnits=%d totalUsage=%d overageUnits=%d overageFee=%d tax=%d totalDue=%d dueAt=%s\n",
+    marBill.Period, marBill.Terms.PlanID, marBill.MonthlyFee, marBill.IncludedUnits,
+    marBill.TotalUsage, marBill.OverageUnits, marBill.OverageFee,
+    marBill.Tax, marBill.TotalDue, marBill.DueAt.Format(time.RFC3339))
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("after mar    suspended=%t\n", st.Suspended)
+
+// 再补开一月账单：账期归当时覆盖它的旧订阅段，条件取自 2026-01-01
+// 首次开通保存的快照（1000/10/100/1000），不能套用重新开通时的新价格。
+// 用量 15、超额 5×100=500；税 (1000+500)×10%=150；应付 1650。
+// 付款截止固定为一月结束后七天，即 2026-02-08 00:00 UTC——四月补账
+// 不顺延。该瞬间早已过去且账单有余额，补账后账户当即欠费停用。
+janBill, err := s.CreateBill(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill jan     period=%s plan=%s monthlyFee=%d includedUnits=%d totalUsage=%d overageUnits=%d overageFee=%d tax=%d totalDue=%d dueAt=%s\n",
+    janBill.Period, janBill.Terms.PlanID, janBill.MonthlyFee, janBill.IncludedUnits,
+    janBill.TotalUsage, janBill.OverageUnits, janBill.OverageFee,
+    janBill.Tax, janBill.TotalDue, janBill.DueAt.Format(time.RFC3339))
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("after jan    suspended=%t currentPlan=%s monthlyFee=%d taxRateBasisPoints=%d\n",
+    st.Suspended, st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.CurrentTerms.TaxRateBasisPoints)
+
+// 三月重新开通不能把空档二月变成可出账月份：补开一月之后再试二月，
+// 仍是 ErrBillBeforeSubscription，查询仍是 ErrBillNotFound。
+_, err = s.CreateBill(accountID, feb)
+fmt.Printf("feb backfill errBillBeforeSubscription=%t\n",
+    errors.Is(err, meter.ErrBillBeforeSubscription))
+_, err = s.GetBill(accountID, feb)
+fmt.Printf("feb backfill errBillNotFound=%t\n", errors.Is(err, meter.ErrBillNotFound))
+
+// 两张账单的查询结果与出账结果完全一致：账期、套餐条件、用量、金额与
+// 付款截止都保持出账时的取值。
+marAgain, err := s.GetBill(accountID, mar)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("get mar      period=%s plan=%s monthlyFee=%d includedUnits=%d totalUsage=%d overageUnits=%d overageFee=%d tax=%d totalDue=%d dueAt=%s\n",
+    marAgain.Period, marAgain.Terms.PlanID, marAgain.MonthlyFee, marAgain.IncludedUnits,
+    marAgain.TotalUsage, marAgain.OverageUnits, marAgain.OverageFee,
+    marAgain.Tax, marAgain.TotalDue, marAgain.DueAt.Format(time.RFC3339))
+janAgain, err := s.GetBill(accountID, jan)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("get jan      period=%s plan=%s monthlyFee=%d includedUnits=%d totalUsage=%d overageUnits=%d overageFee=%d tax=%d totalDue=%d dueAt=%s\n",
+    janAgain.Period, janAgain.Terms.PlanID, janAgain.MonthlyFee, janAgain.IncludedUnits,
+    janAgain.TotalUsage, janAgain.OverageUnits, janAgain.OverageFee,
+    janAgain.Tax, janAgain.TotalDue, janAgain.DueAt.Format(time.RFC3339))
+
+// 账单摘要按账期排列，只含一月与三月（空档二月不在其中）；两张账单都
+// 尚未付款，余额等于应付。
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+for i, b := range st.Bills {
+    fmt.Printf("status bill[%d] period=%s totalDue=%d balance=%d settled=%t dueAt=%s\n",
+        i, b.Period, b.TotalDue, b.Balance, b.Settled, b.DueAt.Format(time.RFC3339))
+}
+// 补开旧账单没有把当前套餐改回旧价格：当前生效条件仍是重新开通时保存
+// 的 2000/20/200/600；订阅仍生效，但账户因一月旧账已过截止而停用。
+fmt.Printf("status       subscribed=%t suspended=%t currentPlan=%s monthlyFee=%d includedUnits=%d overagePrice=%d taxRateBasisPoints=%d\n",
+    st.Subscribed, st.Suspended, st.CurrentTerms.PlanID, st.CurrentTerms.MonthlyFee,
+    st.CurrentTerms.IncludedUnits, st.CurrentTerms.OveragePrice,
+    st.CurrentTerms.TaxRateBasisPoints)
+```
+
+输出（`mustParseTime` 用 `time.Parse(time.RFC3339, value)` 解析上述常量即可）：
+
+```text
+event e-jan  accepted=true period=2026-01
+cancel       cancelled=true endAt=2026-02-01T00:00:00Z
+gap status   subscribed=false currentPlan="" scheduledEnd=<nil>
+plan updated id=plan-a monthlyFee=2000 includedUnits=20 overagePrice=200 taxRateBasisPoints=600
+feb in gap   errBillBeforeSubscription=true
+feb in gap   errBillNotFound=true
+feb usage    period=2026-02 total=0
+resubscribe  subscribed=true plan=plan-a monthlyFee=2000 includedUnits=20 overagePrice=200 taxRateBasisPoints=600
+event e-mar  accepted=true period=2026-03
+before bills subscribed=true suspended=false currentPlan=plan-a monthlyFee=2000
+bill mar     period=2026-03 plan=plan-a monthlyFee=2000 includedUnits=20 totalUsage=25 overageUnits=5 overageFee=1000 tax=180 totalDue=3180 dueAt=2026-04-08T00:00:00Z
+after mar    suspended=false
+bill jan     period=2026-01 plan=plan-a monthlyFee=1000 includedUnits=10 totalUsage=15 overageUnits=5 overageFee=500 tax=150 totalDue=1650 dueAt=2026-02-08T00:00:00Z
+after jan    suspended=true currentPlan=plan-a monthlyFee=2000 taxRateBasisPoints=600
+feb backfill errBillBeforeSubscription=true
+feb backfill errBillNotFound=true
+get mar      period=2026-03 plan=plan-a monthlyFee=2000 includedUnits=20 totalUsage=25 overageUnits=5 overageFee=1000 tax=180 totalDue=3180 dueAt=2026-04-08T00:00:00Z
+get jan      period=2026-01 plan=plan-a monthlyFee=1000 includedUnits=10 totalUsage=15 overageUnits=5 overageFee=500 tax=150 totalDue=1650 dueAt=2026-02-08T00:00:00Z
+status bill[0] period=2026-01 totalDue=1650 balance=1650 settled=false dueAt=2026-02-08T00:00:00Z
+status bill[1] period=2026-03 totalDue=3180 balance=3180 settled=false dueAt=2026-04-08T00:00:00Z
+status       subscribed=true suspended=true currentPlan=plan-a monthlyFee=2000 includedUnits=20 overagePrice=200 taxRateBasisPoints=600
+```
+
+对照输出可以确认：`bill mar` 与 `get mar` 用的是重新开通（3 月 15 日）保存
+的 2000/20/200/600，月中开通仍收完整月费、给完整额度；`bill jan` 与
+`get jan` 用的是首次开通（1 月 1 日）保存的 1000/10/100/1000，同一个套餐
+标识的新价格没有被套到旧月份。两行 `feb` 错误说明空档月份与“早于第一次
+开通”同样得到 `ErrBillBeforeSubscription`，且失败不落账单。`bill jan` 的
+截止仍是 2026-02-08、`bill mar` 的截止是 2026-04-08，四月补账没有顺延；
+`after jan` 与最后一行的 `suspended=true` 提示补开旧账可能当即带来欠费
+停用，而此时 `currentPlan=plan-a` 与四项条件仍是重新开通时的新价格——
+补开旧账不会把当前套餐改回旧价。
+
 ## 月度历史查询：区分“累计为零”与“没有这个月”
 
 `Status` 返回的两份历史列表（`MonthlyUsage` 与 `Bills`）和 `MonthlyUsage`
