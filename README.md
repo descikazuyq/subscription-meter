@@ -1399,3 +1399,197 @@ after pay   subscribed=true suspended=false planID=plan1000 monthlyFee=1000
 event e1    accepted=true period=2026-02
 usage       period=2026-02 total=3
 ```
+
+## 月度历史列表与单月用量：零累计不等于“没有这个月”
+
+`Status` 返回的 `MonthlyUsage` 与 `Bills` 两份列表只收录**实际留下记录**
+的账期，调用者要据此区分“某月累计为零”和“历史里根本没有这个月”：
+
+- **用量列表只包含已经接收过事件或已经生成账单的月份**，每月一条，按年月
+  先后排列（跨年、月份不连续也不补齐空档）。接收一条**数量为零**的事件后，
+  该月仍会出现在列表中，只是累计为零；**没有任何事件但已经出账**的月份
+  同样会出现一条零用量。既没有事件也没有账单的月份，**不会因为订阅一直
+  有效就被自动补进列表**——哪怕中间空了几个月，列表也不会连续铺满。
+- **账单列表只包含实际生成的账单**，同样按账期排列。有用量记录不代表
+  已经出账：只接收过事件、尚未 `CreateBill` 的月份只在用量列表里，不在
+  账单列表里。
+- **单月用量查询** `MonthlyUsage(account, period)` 对没有记录的**合法**
+  月份仍返回该月份和零累计，但它是只读查询：**不会因此新增历史条目，也
+  不会生成账单**。所以只看这个零值无法判断该月究竟是“接收过零数量事件”、
+  “已经出账但没有用量”，还是“什么都没发生”——这三种情况在单月查询里
+  都是零；要区分前两种与第三种，必须看 `Status` 的用量列表里**有没有这个
+  月份这一条**，以及账单列表里有没有对应账单。
+- 一个**没有任何事件和账单的已有账户**（即使订阅持续有效），`Status` 的
+  两份历史列表**都为空**；先查一次零用量再查状态，列表仍为空。
+- 查询**不存在的账户**时，`Status` 与 `MonthlyUsage` 都返回
+  `ErrAccountNotFound`。这是查询失败，不能把它当成“没有历史”而展示成
+  空列表；空列表只用于“账户存在、确实没有记录”。
+
+下面的示例只用公开入口即可运行：通过 `NewServiceWithClock` 把当前时刻
+固定在 2026-04-01 00:00 UTC，使一至三月均已结束，复制后不依赖运行当天
+日期。账户 `acct-hist` 持有一份自 2026-01-01 00:00 UTC 起持续有效的
+订阅，套餐月费 100 分、超额单价与税率均为零：一月只接收一条数量为零的
+事件；二月既无事件也无账单；三月没有事件但在账期结束后生成账单。输出
+展示用量列表只按一月、三月排列且两项累计均为零，账单列表只有三月，
+应付与余额均为 100 分；随后单独查询二月得到零累计，再查账户状态，二月
+仍不出现。示例还对照了一个没有任何事件和账单的已有账户（两份列表都为
+空）与查询不存在账户返回 `ErrAccountNotFound`。每一步都处理调用错误：
+正常步骤失败即 `panic` 停止，预期的“账户不存在”错误显式判断并打印。
+该示例以 Example 测试形式保存在
+`meter/monthly_history_example_test.go`，`go test ./...` 会校验其输出：
+
+```go
+const accountID = "acct-hist"
+feb := meter.MonthOf(mustParseTime("2026-02-01T00:00:00Z"))
+mar := meter.MonthOf(mustParseTime("2026-03-01T00:00:00Z"))
+
+// 把“当前时刻”固定在 2026-04-01 00:00 UTC：一至三月均已结束，
+// 三月可以立即出账；复制后在任何真实日期运行结果都相同。
+s := meter.NewServiceWithClock(func() time.Time {
+    return mustParseTime("2026-04-01T00:00:00Z")
+})
+
+if err := s.CreateAccount(accountID); err != nil {
+    panic(err)
+}
+// 套餐：月费 100 分，超额单价与税率均为零，零用量账单应付就是 100 分。
+if err := s.CreatePlan(meter.Plan{
+    ID: "plan-flat", MonthlyFee: 100, IncludedUnits: 0,
+    OveragePrice: 0, TaxRateBasisPoints: 0,
+}); err != nil {
+    panic(err)
+}
+// 订阅自 2026-01-01 00:00 UTC 起持续有效，不取消、不换套餐。
+if err := s.Subscribe(accountID, "plan-flat",
+    mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+
+// 一月只接收一条数量为零的事件：数量零是合法值，事件被首次接收，
+// 一月因此进入用量历史，但当月累计仍为零。
+ev, err := s.RecordEvent(meter.Event{
+    AccountID: accountID, EventID: "e-jan-zero",
+    At: mustParseTime("2026-01-10T00:00:00Z"), Quantity: 0,
+})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("event jan   accepted=%t period=%s\n", ev.Accepted, ev.Period)
+
+// 二月不接收任何事件，也不生成账单。
+
+// 三月没有任何事件，但 2026-03 账期已结束且被订阅覆盖，直接为它出账：
+// 零用量仍按完整月费计费，应付与余额都是 100 分，出账即让三月进入历史。
+marBill, err := s.CreateBill(accountID, mar)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("bill mar    period=%s totalUsage=%d totalDue=%d balance=%d settled=%t\n",
+    marBill.Period, marBill.TotalUsage, marBill.TotalDue, marBill.Balance, marBill.Settled)
+
+// 账户状态：用量列表只收录“接收过事件或已生成账单”的月份，每月一条，
+// 按年月先后排列——这里只有一月（零数量事件）与三月（已出账），两条
+// 累计均为零；二月既无事件也无账单，不会因订阅一直有效而被补齐。
+// 账单列表只含实际生成的账单，即三月一张；一月有用量记录但没有出账，
+// 不会出现在账单列表中。
+st, err := s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+for _, u := range st.MonthlyUsage {
+    fmt.Printf("status usage period=%s total=%d\n", u.Period, u.Total)
+}
+for _, b := range st.Bills {
+    fmt.Printf("status bill  period=%s totalDue=%d balance=%d settled=%t\n",
+        b.Period, b.TotalDue, b.Balance, b.Settled)
+}
+
+// 单独查询二月：合法账期、没有任何记录，仍返回该月份与零累计。
+// 注意这个零值不新增历史条目，也不生成账单；仅凭它无法区分“接收过
+// 零数量事件”“已经出账但无用量”“什么都没发生”，三者单月查询都是零。
+u, err := s.MonthlyUsage(accountID, feb)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("feb query   period=%s total=%d\n", u.Period, u.Total)
+
+// 再查账户状态：二月仍不出现在用量列表，账单列表也仍只有三月，
+// 两份列表与单月查询前完全相同。
+st, err = s.Status(accountID)
+if err != nil {
+    panic(err)
+}
+usagePeriods := make([]meter.Month, 0, len(st.MonthlyUsage))
+for _, x := range st.MonthlyUsage {
+    usagePeriods = append(usagePeriods, x.Period)
+}
+billPeriods := make([]meter.Month, 0, len(st.Bills))
+for _, b := range st.Bills {
+    billPeriods = append(billPeriods, b.Period)
+}
+fmt.Printf("after query  usagePeriods=%v billPeriods=%v\n", usagePeriods, billPeriods)
+
+// 对照账户：已创建且订阅同样自一月起有效，但没有任何事件和账单，
+// 两份历史列表都为空。
+if err := s.CreateAccount("acct-empty"); err != nil {
+    panic(err)
+}
+if err := s.Subscribe("acct-empty", "plan-flat",
+    mustParseTime("2026-01-01T00:00:00Z")); err != nil {
+    panic(err)
+}
+empty, err := s.Status("acct-empty")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("empty status usageEntries=%d billEntries=%d\n",
+    len(empty.MonthlyUsage), len(empty.Bills))
+
+// 对这个空账户单独查询一个没有记录的合法月份：返回零累计，但查询
+// 不补条目；随后再查状态，两份列表仍然都为空。
+u, err = s.MonthlyUsage("acct-empty", feb)
+if err != nil {
+    panic(err)
+}
+fmt.Printf("empty query  period=%s total=%d\n", u.Period, u.Total)
+empty, err = s.Status("acct-empty")
+if err != nil {
+    panic(err)
+}
+fmt.Printf("empty after  usageEntries=%d billEntries=%d\n",
+    len(empty.MonthlyUsage), len(empty.Bills))
+
+// 查询不存在的账户：状态与单月用量查询都返回 ErrAccountNotFound。
+// 不能把查询失败当成“没有历史”而展示成空列表。
+_, err = s.Status("acct-missing")
+fmt.Printf("missing status errAccountNotFound=%t\n",
+    errors.Is(err, meter.ErrAccountNotFound))
+_, err = s.MonthlyUsage("acct-missing", feb)
+fmt.Printf("missing usage  errAccountNotFound=%t\n",
+    errors.Is(err, meter.ErrAccountNotFound))
+```
+
+输出（`mustParseTime` 用 `time.Parse(time.RFC3339, value)` 解析上述常量即可）：
+
+```text
+event jan   accepted=true period=2026-01
+bill mar    period=2026-03 totalUsage=0 totalDue=100 balance=100 settled=false
+status usage period=2026-01 total=0
+status usage period=2026-03 total=0
+status bill  period=2026-03 totalDue=100 balance=100 settled=false
+feb query   period=2026-02 total=0
+after query  usagePeriods=[2026-01 2026-03] billPeriods=[2026-03]
+empty status usageEntries=0 billEntries=0
+empty query  period=2026-02 total=0
+empty after  usageEntries=0 billEntries=0
+missing status errAccountNotFound=true
+missing usage  errAccountNotFound=true
+```
+
+对照输出可以确认三种“零”的区别：一月与三月在用量列表里都有一条累计为
+零的记录，但来源不同——一月来自一条零数量事件，三月来自零用量出账；
+二月单独查询同样是零，却始终不在列表里（`usagePeriods` 仍是
+`[2026-01 2026-03]`），说明单月零用量查询不写历史、不出账。账单列表
+始终只有三月，表明“有零用量记录”不等于“已经出账”。`acct-empty` 两行
+证明订阅有效不会凭空补出月份；最后两行则强调账户不存在是错误而不是空
+历史。
