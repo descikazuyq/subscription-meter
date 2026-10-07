@@ -50,7 +50,8 @@ var (
 
 	// ErrBillNotFound 指定账期尚未生成账单。
 	ErrBillNotFound = errors.New("meter: bill not found")
-	// ErrBillBeforeSubscription 只能为开通当月及以后生成账单。
+	// ErrBillBeforeSubscription 指定账期不被任何订阅段覆盖：早于首次开通
+	// 当月，或处于两段订阅之间、完全无订阅的空档月份。
 	ErrBillBeforeSubscription = errors.New("meter: bill period before subscription")
 	// ErrBillMonthNotEnded 只能为已经结束的月份生成账单。
 	ErrBillMonthNotEnded = errors.New("meter: bill period has not ended")
